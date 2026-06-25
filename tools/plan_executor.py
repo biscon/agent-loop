@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,10 @@ from typing import Any
 
 DONE_STATUSES = {"Completed", "Deferred"}
 VALID_TYPES = {"phase", "pass"}
+DEFAULT_RUNS_DIR = Path(".agent-runs")
+PLAN_COPY_NAME = "plan.md"
+WORKSPACE_DIR_NAME = "workspace"
+SANDBOX_DIR_NAME = "agent_loop_sandbox"
 
 
 class PlanError(Exception):
@@ -65,11 +71,41 @@ class PlanState:
     validation_details: list[str]
 
 
+@dataclass(frozen=True)
+class PlanFiles:
+    original_plan_file: Path
+    plan_file: Path
+    workspace_dir: Path | None = None
+    sandbox_dir: Path | None = None
+
+    @property
+    def copied(self) -> bool:
+        return self.workspace_dir is not None
+
+
+@dataclass(frozen=True)
+class PlanStateBlock:
+    opener_line: int
+    start_index: int
+    end_index: int
+    content: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Select the first unfinished item from a markdown plan-state-json block."
     )
     parser.add_argument("plan_file", help="Path to the markdown plan file.")
+    parser.add_argument(
+        "--copy-to-run-dir",
+        nargs="?",
+        const="",
+        metavar="RUN_DIR",
+        help=(
+            "Copy the plan into a run directory before selecting. "
+            "If RUN_DIR is omitted, use .agent-runs/<timestamp>/."
+        ),
+    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -99,13 +135,8 @@ def is_plan_state_opener(line: str) -> bool:
     return first_token == "plan-state-json"
 
 
-def extract_plan_state_json(plan_file: Path) -> str:
-    try:
-        lines = plan_file.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise PlanError(f"{plan_file}: failed to read plan file: {exc}") from exc
-
-    blocks: list[tuple[int, str]] = []
+def find_plan_state_blocks(lines: list[str], plan_file: Path) -> list[PlanStateBlock]:
+    blocks: list[PlanStateBlock] = []
     index = 0
     while index < len(lines):
         if not is_plan_state_opener(lines[index]):
@@ -113,6 +144,7 @@ def extract_plan_state_json(plan_file: Path) -> str:
             continue
 
         opener_line = index + 1
+        start_index = index
         content: list[str] = []
         index += 1
         while index < len(lines) and lines[index].strip() != "```":
@@ -125,19 +157,52 @@ def extract_plan_state_json(plan_file: Path) -> str:
                 "has no closing ``` fence"
             )
 
-        blocks.append((opener_line, "\n".join(content)))
+        blocks.append(
+            PlanStateBlock(
+                opener_line=opener_line,
+                start_index=start_index,
+                end_index=index,
+                content="\n".join(content),
+            )
+        )
         index += 1
 
+    return blocks
+
+
+def get_single_plan_state_block(lines: list[str], plan_file: Path) -> PlanStateBlock:
+    blocks = find_plan_state_blocks(lines, plan_file)
     if not blocks:
         raise PlanError(f"{plan_file}: missing plan-state-json fenced block")
     if len(blocks) > 1:
-        lines_text = ", ".join(str(line_no) for line_no, _ in blocks)
+        lines_text = ", ".join(str(block.opener_line) for block in blocks)
         raise PlanError(
             f"{plan_file}: expected exactly one plan-state-json block, "
             f"found {len(blocks)} on lines {lines_text}"
         )
+    return blocks[0]
 
-    return blocks[0][1]
+
+def read_plan_lines(plan_file: Path) -> list[str]:
+    try:
+        return plan_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise PlanError(f"{plan_file}: failed to read plan file: {exc}") from exc
+
+
+def extract_plan_state_json(plan_file: Path) -> str:
+    block = get_single_plan_state_block(read_plan_lines(plan_file), plan_file)
+    return block.content
+
+
+def patch_sandbox_refs(text: str, sandbox_dir: Path) -> str:
+    sandbox_text = str(sandbox_dir)
+    placeholder = "__PLAN_EXECUTOR_SANDBOX_DIR__"
+    return (
+        text.replace("agent_loop_sandbox/", f"{placeholder}/")
+        .replace("agent_loop_sandbox", placeholder)
+        .replace(placeholder, sandbox_text)
+    )
 
 
 def load_json_state(plan_file: Path) -> dict[str, Any]:
@@ -153,6 +218,110 @@ def load_json_state(plan_file: Path) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise PlanError(f"{plan_file}: plan-state-json top level must be an object")
     return loaded
+
+
+def load_plan_state_from_file(plan_file: Path) -> PlanState:
+    return validate_plan_state(load_json_state(plan_file))
+
+
+def generated_run_dir() -> Path:
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    base = DEFAULT_RUNS_DIR / timestamp
+    if not base.exists():
+        return base
+
+    for suffix in range(1, 1000):
+        candidate = DEFAULT_RUNS_DIR / f"{timestamp}-{suffix:03d}"
+        if not candidate.exists():
+            return candidate
+
+    raise PlanError("failed to find an unused timestamped run directory")
+
+
+def ensure_run_dir(run_dir: Path, explicit: bool) -> None:
+    if run_dir.exists():
+        if not run_dir.is_dir():
+            raise PlanError(f"{run_dir}: run directory path exists but is not a directory")
+        if any(run_dir.iterdir()):
+            if explicit:
+                raise PlanError(f"{run_dir}: run directory already exists and is not empty")
+            raise PlanError(f"{run_dir}: generated run directory already exists")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+
+def patch_copied_plan(plan_file: Path, sandbox_dir: Path) -> None:
+    try:
+        original_text = plan_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"{plan_file}: failed to read copied plan: {exc}") from exc
+
+    had_trailing_newline = original_text.endswith("\n")
+    lines = original_text.splitlines()
+    block = get_single_plan_state_block(lines, plan_file)
+
+    try:
+        state = json.loads(block.content)
+    except json.JSONDecodeError as exc:
+        raise PlanError(
+            f"{plan_file}: invalid JSON in plan-state-json block at "
+            f"line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(state, dict):
+        raise PlanError(f"{plan_file}: plan-state-json top level must be an object")
+
+    state["sandbox_dir"] = str(sandbox_dir)
+    patched_json = json.dumps(state, indent=2)
+
+    before_block = [patch_sandbox_refs(line, sandbox_dir) for line in lines[: block.start_index]]
+    after_block = [patch_sandbox_refs(line, sandbox_dir) for line in lines[block.end_index + 1 :]]
+    patched_lines = (
+        before_block
+        + [lines[block.start_index]]
+        + patched_json.splitlines()
+        + [lines[block.end_index]]
+        + after_block
+    )
+    patched_text = "\n".join(patched_lines)
+    if had_trailing_newline:
+        patched_text += "\n"
+
+    try:
+        plan_file.write_text(patched_text, encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"{plan_file}: failed to write patched plan: {exc}") from exc
+
+
+def prepare_plan_file(
+    original_plan_file: Path, copy_to_run_dir: str | None = None
+) -> PlanFiles:
+    if copy_to_run_dir is None:
+        return PlanFiles(original_plan_file=original_plan_file, plan_file=original_plan_file)
+
+    explicit = copy_to_run_dir != ""
+    run_dir = Path(copy_to_run_dir) if explicit else generated_run_dir()
+    plan_copy = run_dir / PLAN_COPY_NAME
+    workspace_dir = run_dir / WORKSPACE_DIR_NAME
+    sandbox_dir = workspace_dir / SANDBOX_DIR_NAME
+
+    ensure_run_dir(run_dir, explicit=explicit)
+    if plan_copy.exists():
+        raise PlanError(f"{plan_copy}: copied plan already exists")
+    if workspace_dir.exists():
+        raise PlanError(f"{workspace_dir}: workspace directory already exists")
+
+    try:
+        shutil.copy2(original_plan_file, plan_copy)
+        workspace_dir.mkdir()
+    except OSError as exc:
+        raise PlanError(f"{run_dir}: failed to prepare run directory: {exc}") from exc
+
+    patch_copied_plan(plan_copy, sandbox_dir)
+    return PlanFiles(
+        original_plan_file=original_plan_file,
+        plan_file=plan_copy,
+        workspace_dir=workspace_dir,
+        sandbox_dir=sandbox_dir,
+    )
 
 
 def require_non_empty_string(
@@ -296,7 +465,7 @@ def select_next_item(plan_state: PlanState, include_parents: bool) -> Selection:
 
 
 def print_human_output(
-    plan_file: Path,
+    plan_files: PlanFiles,
     plan_state: PlanState,
     selection: Selection,
     verbose: bool,
@@ -307,7 +476,13 @@ def print_human_output(
             print(f"- {detail}")
         print()
 
-    print(f"Plan file: {plan_file}")
+    if plan_files.copied:
+        print(f"Original plan file: {plan_files.original_plan_file}")
+        print(f"Active plan file: {plan_files.plan_file}")
+        print(f"Workspace dir: {plan_files.workspace_dir}")
+        print(f"Sandbox dir: {plan_files.sandbox_dir}")
+    else:
+        print(f"Plan file: {plan_files.plan_file}")
     print(f"Plan ID: {plan_state.plan_id}")
 
     if selection.item is None:
@@ -327,21 +502,28 @@ def print_human_output(
     if selection.warning is not None:
         print(f"Warning: {selection.warning}")
 
-    print(f"Suggested next Codex prompt: Read {plan_file} and execute {item.id} only.")
+    print(
+        f"Suggested next Codex prompt: Read {plan_files.plan_file} "
+        f"and execute {item.id} only."
+    )
 
 
 def build_json_output(
-    plan_file: Path,
+    plan_files: PlanFiles,
     plan_state: PlanState,
     selection: Selection,
     verbose: bool,
 ) -> dict[str, Any]:
     output: dict[str, Any] = {
-        "plan_file": str(plan_file),
+        "plan_file": str(plan_files.plan_file),
         "plan_id": plan_state.plan_id,
         "complete": selection.item is None,
         "selected": selection.item.to_json_obj() if selection.item is not None else None,
     }
+    if plan_files.copied:
+        output["original_plan_file"] = str(plan_files.original_plan_file)
+        output["workspace_dir"] = str(plan_files.workspace_dir)
+        output["sandbox_dir"] = str(plan_files.sandbox_dir)
     if selection.warning is not None:
         output["warning"] = selection.warning
     if verbose:
@@ -351,11 +533,11 @@ def build_json_output(
 
 def main() -> int:
     args = parse_args()
-    plan_file = Path(args.plan_file)
+    original_plan_file = Path(args.plan_file)
 
     try:
-        raw_state = load_json_state(plan_file)
-        plan_state = validate_plan_state(raw_state)
+        plan_files = prepare_plan_file(original_plan_file, args.copy_to_run_dir)
+        plan_state = load_plan_state_from_file(plan_files.plan_file)
         selection = select_next_item(plan_state, include_parents=args.include_parents)
     except PlanError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -364,12 +546,12 @@ def main() -> int:
     if args.json:
         print(
             json.dumps(
-                build_json_output(plan_file, plan_state, selection, args.verbose),
+                build_json_output(plan_files, plan_state, selection, args.verbose),
                 indent=2,
             )
         )
     else:
-        print_human_output(plan_file, plan_state, selection, args.verbose)
+        print_human_output(plan_files, plan_state, selection, args.verbose)
 
     return 0
 
