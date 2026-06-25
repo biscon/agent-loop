@@ -118,6 +118,8 @@ class ExecutionResult:
     selected_after: Selection
     codex_returncode: int
     logs_dir: Path
+    plan_backup_before: Path
+    plan_backup_after: Path
     harness_checks: list[HarnessCheck]
     prompt: str
     same_selection_warning: str | None = None
@@ -632,6 +634,13 @@ def write_json_file(path: Path, data: Any) -> None:
     write_text_file(path, json.dumps(data, indent=2) + "\n")
 
 
+def copy_plan_backup(source: Path, destination: Path) -> None:
+    try:
+        shutil.copy2(source, destination)
+    except OSError as exc:
+        raise PlanError(f"failed to copy plan backup from {source} to {destination}: {exc}") from exc
+
+
 def run_harness_checks() -> list[HarnessCheck]:
     checks: list[HarnessCheck] = []
     for command in (
@@ -668,6 +677,10 @@ def execute_next(
     except OSError as exc:
         raise PlanError(f"{logs_dir}: failed to create logs directory: {exc}") from exc
 
+    plan_backup_before = logs_dir / "plan_before.md"
+    plan_backup_after = logs_dir / "plan_after.md"
+    copy_plan_backup(plan_files.plan_file, plan_backup_before)
+
     prompt = build_codex_prompt(plan_files.plan_file, selected_before.item.id)
     write_text_file(logs_dir / "codex_prompt.txt", prompt)
     write_json_file(logs_dir / "selection_before.json", selection_to_json_obj(selected_before))
@@ -680,11 +693,13 @@ def execute_next(
         )
     except OSError as exc:
         write_text_file(logs_dir / "codex_error.txt", str(exc) + "\n")
+        copy_plan_backup(plan_files.plan_file, plan_backup_after)
         raise PlanError(f"failed to run {codex_bin!r}: {exc}") from exc
 
     write_text_file(logs_dir / "codex_stdout.txt", completed.stdout)
     write_text_file(logs_dir / "codex_stderr.txt", completed.stderr)
     write_text_file(logs_dir / "codex_returncode.txt", f"{completed.returncode}\n")
+    copy_plan_backup(plan_files.plan_file, plan_backup_after)
 
     plan_state_after = load_plan_state_from_file(plan_files.plan_file)
     selected_after = select_next_item(plan_state_after, include_parents=include_parents)
@@ -711,6 +726,8 @@ def execute_next(
         selected_after=selected_after,
         codex_returncode=completed.returncode,
         logs_dir=logs_dir,
+        plan_backup_before=plan_backup_before,
+        plan_backup_after=plan_backup_after,
         harness_checks=harness_checks,
         prompt=prompt,
         same_selection_warning=same_selection_warning,
@@ -816,6 +833,8 @@ def print_execution_output(
     print()
     print(f"Codex command: {codex_bin} exec <prompt>")
     print(f"Logs dir: {result.logs_dir}")
+    print(f"Plan backup before: {result.plan_backup_before}")
+    print(f"Plan backup after: {result.plan_backup_after}")
     print(f"Codex return code: {result.codex_returncode}")
     print()
     print_selection_details(plan_state_after, result.selected_after, "Selected after execution:")
@@ -878,6 +897,8 @@ def build_execution_json_output(
     )
     output["codex_returncode"] = result.codex_returncode
     output["logs_dir"] = str(result.logs_dir)
+    output["plan_backup_before"] = str(result.plan_backup_before)
+    output["plan_backup_after"] = str(result.plan_backup_after)
     output["harness_checks"] = [check.to_json_obj() for check in result.harness_checks]
     if result.same_selection_warning is not None:
         output["warning"] = result.same_selection_warning

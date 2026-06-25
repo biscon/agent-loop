@@ -359,6 +359,9 @@ class PlanExecutorTests(unittest.TestCase):
             )
             log_dirs = list((tmp_path / ".agent-runs").glob("in-place-test_plan-*/logs/*"))
             self.assertEqual(len(log_dirs), 1)
+            logs_dir = log_dirs[0]
+            self.assertTrue((logs_dir / "plan_before.md").exists())
+            self.assertTrue((logs_dir / "plan_after.md").exists())
             self.assertFalse((tmp_path / "logs").exists())
 
     def test_status_does_not_call_codex(self) -> None:
@@ -385,6 +388,8 @@ class PlanExecutorTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertFalse(marker.exists())
             self.assertFalse((run_dir / "logs").exists())
+            self.assertEqual(list(run_dir.glob("**/plan_before.md")), [])
+            self.assertEqual(list(run_dir.glob("**/plan_after.md")), [])
 
     def test_copy_mode_default_executes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -423,6 +428,8 @@ class PlanExecutorTests(unittest.TestCase):
                 "selection_before.json",
                 "selection_after.json",
                 "harness_checks.json",
+                "plan_before.md",
+                "plan_after.md",
             ):
                 self.assertTrue((logs_dir / name).exists(), name)
             self.assertEqual(
@@ -526,6 +533,97 @@ class PlanExecutorTests(unittest.TestCase):
             self.assertIn("Execute phase_01 only.", completed.stdout)
             self.assertFalse(marker.exists())
             self.assertFalse((run_dir / "logs").exists())
+            self.assertEqual(list(run_dir.glob("**/plan_before.md")), [])
+            self.assertEqual(list(run_dir.glob("**/plan_after.md")), [])
+
+    def test_execution_writes_plan_before_and_after_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_codex = Path(tmp) / "fake_codex.py"
+            marker = Path(tmp) / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            logs_dir = next((tmp_path / ".agent-runs").glob("in-place-test_plan-*/logs/*"))
+            before_state = plan_executor.load_json_state(logs_dir / "plan_before.md")
+            after_state = plan_executor.load_json_state(logs_dir / "plan_after.md")
+            self.assertEqual(before_state["items"][0]["status"], "Not Started")
+            self.assertEqual(after_state["items"][0]["status"], "Completed")
+
+    def test_in_place_plan_execution_uses_backup_under_agent_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "project_plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_codex = Path(tmp) / "fake_codex.py"
+            marker = Path(tmp) / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                plan_executor.load_json_state(plan_file)["items"][0]["status"],
+                "Completed",
+            )
+            log_dirs = list((tmp_path / ".agent-runs").glob("in-place-test_plan-*/logs/*"))
+            self.assertEqual(len(log_dirs), 1)
+            self.assertTrue((log_dirs[0] / "plan_before.md").exists())
+            self.assertTrue((log_dirs[0] / "plan_after.md").exists())
+            self.assertFalse((tmp_path / "logs").exists())
+
+    def test_copy_mode_execution_also_writes_plan_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = Path(tmp) / ".agent-runs" / "run"
+            fake_codex = Path(tmp) / "fake_codex.py"
+            marker = Path(tmp) / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(REAL_PLAN),
+                    "--copy-to-run-dir",
+                    str(run_dir),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            logs_dir = next((run_dir / "logs").glob("*-phase_01"))
+            self.assertTrue((logs_dir / "plan_before.md").exists())
+            self.assertTrue((logs_dir / "plan_after.md").exists())
 
     def test_run_all_is_not_implemented(self) -> None:
         completed = subprocess.run(
