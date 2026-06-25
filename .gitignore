@@ -1,0 +1,5 @@
+.agent-runs/
+agent_loop_sandbox/
+__pycache__/
+*.pyc
+

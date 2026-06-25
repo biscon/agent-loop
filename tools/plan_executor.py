@@ -7,8 +7,9 @@ import argparse
 import datetime as dt
 import json
 import shutil
+import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ DEFAULT_RUNS_DIR = Path(".agent-runs")
 PLAN_COPY_NAME = "plan.md"
 WORKSPACE_DIR_NAME = "workspace"
 SANDBOX_DIR_NAME = "agent_loop_sandbox"
+LOGS_DIR_NAME = "logs"
 
 
 class PlanError(Exception):
@@ -75,12 +77,15 @@ class PlanState:
 class PlanFiles:
     original_plan_file: Path
     plan_file: Path
+    mode: str
+    run_dir: Path | None = None
     workspace_dir: Path | None = None
     sandbox_dir: Path | None = None
+    mutates_active_plan: bool = True
 
     @property
     def copied(self) -> bool:
-        return self.workspace_dir is not None
+        return self.mode == "copy"
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,33 @@ class PlanStateBlock:
     start_index: int
     end_index: int
     content: str
+
+
+@dataclass(frozen=True)
+class HarnessCheck:
+    command: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+    def to_json_obj(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "returncode": self.returncode,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    selected_before: Selection
+    selected_after: Selection
+    codex_returncode: int
+    logs_dir: Path
+    harness_checks: list[HarnessCheck]
+    prompt: str
+    same_selection_warning: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +142,31 @@ def parse_args() -> argparse.Namespace:
         "--json",
         action="store_true",
         help="Print machine-readable JSON output.",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Only parse, validate, and print the next item without executing Codex.",
+    )
+    parser.add_argument(
+        "--execute-next",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--run-all",
+        action="store_true",
+        help="Reserved for future multi-pass execution.",
+    )
+    parser.add_argument(
+        "--codex-bin",
+        default="codex",
+        help="Codex executable to use for execution. Defaults to codex.",
+    )
+    parser.add_argument(
+        "--dry-run-prompt",
+        action="store_true",
+        help="Print the exact Codex prompt that would be sent without running Codex.",
     )
     parser.add_argument(
         "--include-parents",
@@ -224,6 +281,15 @@ def load_plan_state_from_file(plan_file: Path) -> PlanState:
     return validate_plan_state(load_json_state(plan_file))
 
 
+def selection_to_json_obj(selection: Selection) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "selected": selection.item.to_json_obj() if selection.item is not None else None,
+    }
+    if selection.warning is not None:
+        output["warning"] = selection.warning
+    return output
+
+
 def generated_run_dir() -> Path:
     timestamp = dt.datetime.now().strftime("%Y-%m-%d-%H%M%S")
     base = DEFAULT_RUNS_DIR / timestamp
@@ -236,6 +302,48 @@ def generated_run_dir() -> Path:
             return candidate
 
     raise PlanError("failed to find an unused timestamped run directory")
+
+
+def timestamp() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+
+
+def safe_path_part(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in ("-", "_") else "-" for char in value)
+    return safe.strip("-") or "plan"
+
+
+def is_existing_run_plan(plan_file: Path) -> bool:
+    return plan_file.name == PLAN_COPY_NAME and plan_file.parent.parent.name == ".agent-runs"
+
+
+def generated_in_place_run_dir(plan_id: str) -> Path:
+    base_name = f"in-place-{safe_path_part(plan_id)}-{timestamp()}"
+    base = DEFAULT_RUNS_DIR / base_name
+    if not base.exists():
+        return base
+
+    for suffix in range(2, 1000):
+        candidate = DEFAULT_RUNS_DIR / f"{base_name}-{suffix}"
+        if not candidate.exists():
+            return candidate
+
+    raise PlanError("failed to find an unused in-place run directory")
+
+
+def per_pass_logs_dir(run_dir: Path, selected_id: str) -> Path:
+    logs_root = run_dir / LOGS_DIR_NAME
+    base_name = f"{timestamp()}-{safe_path_part(selected_id)}"
+    base = logs_root / base_name
+    if not base.exists():
+        return base
+
+    for suffix in range(2, 1000):
+        candidate = logs_root / f"{base_name}-{suffix}"
+        if not candidate.exists():
+            return candidate
+
+    raise PlanError("failed to find an unused per-pass logs directory")
 
 
 def ensure_run_dir(run_dir: Path, explicit: bool) -> None:
@@ -295,7 +403,19 @@ def prepare_plan_file(
     original_plan_file: Path, copy_to_run_dir: str | None = None
 ) -> PlanFiles:
     if copy_to_run_dir is None:
-        return PlanFiles(original_plan_file=original_plan_file, plan_file=original_plan_file)
+        if is_existing_run_plan(original_plan_file):
+            return PlanFiles(
+                original_plan_file=original_plan_file,
+                plan_file=original_plan_file,
+                mode="existing-run",
+                run_dir=original_plan_file.parent,
+                workspace_dir=original_plan_file.parent / WORKSPACE_DIR_NAME,
+            )
+        return PlanFiles(
+            original_plan_file=original_plan_file,
+            plan_file=original_plan_file,
+            mode="in-place",
+        )
 
     explicit = copy_to_run_dir != ""
     run_dir = Path(copy_to_run_dir) if explicit else generated_run_dir()
@@ -319,9 +439,25 @@ def prepare_plan_file(
     return PlanFiles(
         original_plan_file=original_plan_file,
         plan_file=plan_copy,
+        mode="copy",
+        run_dir=run_dir,
         workspace_dir=workspace_dir,
         sandbox_dir=sandbox_dir,
     )
+
+
+def with_plan_state_context(plan_files: PlanFiles, raw_state: dict[str, Any]) -> PlanFiles:
+    sandbox_dir = plan_files.sandbox_dir
+    raw_sandbox_dir = raw_state.get("sandbox_dir")
+    if sandbox_dir is None and isinstance(raw_sandbox_dir, str) and raw_sandbox_dir:
+        sandbox_dir = Path(raw_sandbox_dir)
+    return replace(plan_files, sandbox_dir=sandbox_dir)
+
+
+def with_execution_run_dir(plan_files: PlanFiles, plan_id: str) -> PlanFiles:
+    if plan_files.run_dir is not None:
+        return plan_files
+    return replace(plan_files, run_dir=generated_in_place_run_dir(plan_id))
 
 
 def require_non_empty_string(
@@ -464,6 +600,123 @@ def select_next_item(plan_state: PlanState, include_parents: bool) -> Selection:
     return Selection(item=None)
 
 
+def build_codex_prompt(plan_file: Path, selected_id: str) -> str:
+    return f"""Read {plan_file}.
+
+Execute {selected_id} only.
+
+Important:
+- Follow the "How To Use This Plan" section in {plan_file}.
+- Execute exactly one phase/pass.
+- Do not skip ahead.
+- Do not execute multiple phases/passes.
+- If {selected_id} is too broad, update {plan_file} with smaller passes under that phase and stop.
+- If implementing, keep all generated artifacts under the sandbox_dir specified in the plan-state-json block.
+- Update {plan_file} after the pass according to its execution tracking rules.
+- Run the checks listed for the selected phase/pass.
+- Do not commit.
+- Do not push.
+- Do not use gh.
+- Do not modify files outside the active plan and its specified sandbox/workspace unless the selected phase/pass explicitly requires it.
+"""
+
+
+def write_text_file(path: Path, text: str) -> None:
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"{path}: failed to write file: {exc}") from exc
+
+
+def write_json_file(path: Path, data: Any) -> None:
+    write_text_file(path, json.dumps(data, indent=2) + "\n")
+
+
+def run_harness_checks() -> list[HarnessCheck]:
+    checks: list[HarnessCheck] = []
+    for command in (
+        ["git", "diff", "--check"],
+        ["git", "diff", "--stat"],
+        ["git", "status", "--short"],
+    ):
+        completed = subprocess.run(command, capture_output=True, text=True)
+        checks.append(
+            HarnessCheck(
+                command=command,
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+        )
+    return checks
+
+
+def execute_next(
+    plan_files: PlanFiles,
+    selected_before: Selection,
+    include_parents: bool,
+    codex_bin: str,
+) -> ExecutionResult:
+    if selected_before.item is None:
+        raise PlanError("cannot execute next item because the plan is complete")
+    if plan_files.run_dir is None:
+        raise PlanError("execution requires a run directory")
+
+    logs_dir = per_pass_logs_dir(plan_files.run_dir, selected_before.item.id)
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        raise PlanError(f"{logs_dir}: failed to create logs directory: {exc}") from exc
+
+    prompt = build_codex_prompt(plan_files.plan_file, selected_before.item.id)
+    write_text_file(logs_dir / "codex_prompt.txt", prompt)
+    write_json_file(logs_dir / "selection_before.json", selection_to_json_obj(selected_before))
+
+    try:
+        completed = subprocess.run(
+            [codex_bin, "exec", prompt],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        write_text_file(logs_dir / "codex_error.txt", str(exc) + "\n")
+        raise PlanError(f"failed to run {codex_bin!r}: {exc}") from exc
+
+    write_text_file(logs_dir / "codex_stdout.txt", completed.stdout)
+    write_text_file(logs_dir / "codex_stderr.txt", completed.stderr)
+    write_text_file(logs_dir / "codex_returncode.txt", f"{completed.returncode}\n")
+
+    plan_state_after = load_plan_state_from_file(plan_files.plan_file)
+    selected_after = select_next_item(plan_state_after, include_parents=include_parents)
+    write_json_file(logs_dir / "selection_after.json", selection_to_json_obj(selected_after))
+
+    harness_checks = run_harness_checks()
+    write_json_file(
+        logs_dir / "harness_checks.json",
+        [check.to_json_obj() for check in harness_checks],
+    )
+    same_selection_warning = None
+    if (
+        selected_before.item is not None
+        and selected_after.item is not None
+        and selected_before.item.id == selected_after.item.id
+    ):
+        same_selection_warning = (
+            "selected item did not advance. Codex may have failed, split the phase, "
+            "or left the plan incomplete."
+        )
+
+    return ExecutionResult(
+        selected_before=selected_before,
+        selected_after=selected_after,
+        codex_returncode=completed.returncode,
+        logs_dir=logs_dir,
+        harness_checks=harness_checks,
+        prompt=prompt,
+        same_selection_warning=same_selection_warning,
+    )
+
+
 def print_human_output(
     plan_files: PlanFiles,
     plan_state: PlanState,
@@ -479,10 +732,15 @@ def print_human_output(
     if plan_files.copied:
         print(f"Original plan file: {plan_files.original_plan_file}")
         print(f"Active plan file: {plan_files.plan_file}")
-        print(f"Workspace dir: {plan_files.workspace_dir}")
-        print(f"Sandbox dir: {plan_files.sandbox_dir}")
     else:
         print(f"Plan file: {plan_files.plan_file}")
+    print(f"Mode: {plan_files.mode}")
+    print(f"Run dir: {plan_files.run_dir if plan_files.run_dir is not None else '(generated on execution)'}")
+    if plan_files.workspace_dir is not None:
+        print(f"Workspace dir: {plan_files.workspace_dir}")
+    if plan_files.sandbox_dir is not None:
+        print(f"Sandbox dir: {plan_files.sandbox_dir}")
+    print("Plan mutation: active plan will be updated in place by Codex execution.")
     print(f"Plan ID: {plan_state.plan_id}")
 
     if selection.item is None:
@@ -508,6 +766,65 @@ def print_human_output(
     )
 
 
+def print_selection_details(
+    plan_state: PlanState,
+    selection: Selection,
+    label: str,
+) -> None:
+    print(label)
+    if selection.item is None:
+        print("Plan complete: no unfinished items remain.")
+        return
+
+    item = selection.item
+    print(f"Selected ID: {item.id}")
+    print(f"Selected title: {item.title}")
+    print(f"Selected type: {item.type}")
+    print(f"Selected status: {item.status}")
+    if item.parent is not None:
+        parent = plan_state.items_by_id[item.parent]
+        print(f"Parent: {parent.id} - {parent.title}")
+    if selection.warning is not None:
+        print(f"Warning: {selection.warning}")
+
+
+def print_harness_checks(harness_checks: list[HarnessCheck]) -> None:
+    print("Harness checks:")
+    for check in harness_checks:
+        print(f"$ {' '.join(check.command)}")
+        print(f"Return code: {check.returncode}")
+        if check.stdout:
+            print(check.stdout.rstrip())
+        if check.stderr:
+            print(check.stderr.rstrip(), file=sys.stderr)
+
+
+def print_execution_output(
+    plan_files: PlanFiles,
+    plan_state_before: PlanState,
+    plan_state_after: PlanState,
+    result: ExecutionResult,
+    codex_bin: str,
+    verbose: bool,
+) -> None:
+    print_human_output(
+        plan_files,
+        plan_state_before,
+        result.selected_before,
+        verbose,
+    )
+    print()
+    print(f"Codex command: {codex_bin} exec <prompt>")
+    print(f"Logs dir: {result.logs_dir}")
+    print(f"Codex return code: {result.codex_returncode}")
+    print()
+    print_selection_details(plan_state_after, result.selected_after, "Selected after execution:")
+    if result.same_selection_warning is not None:
+        print(f"Warning: {result.same_selection_warning}")
+    print()
+    print_harness_checks(result.harness_checks)
+
+
 def build_json_output(
     plan_files: PlanFiles,
     plan_state: PlanState,
@@ -516,14 +833,20 @@ def build_json_output(
 ) -> dict[str, Any]:
     output: dict[str, Any] = {
         "plan_file": str(plan_files.plan_file),
+        "mode": plan_files.mode,
+        "run_dir": str(plan_files.run_dir) if plan_files.run_dir is not None else None,
+        "mutates_active_plan": plan_files.mutates_active_plan,
         "plan_id": plan_state.plan_id,
         "complete": selection.item is None,
         "selected": selection.item.to_json_obj() if selection.item is not None else None,
     }
-    if plan_files.copied:
-        output["original_plan_file"] = str(plan_files.original_plan_file)
-        output["workspace_dir"] = str(plan_files.workspace_dir)
-        output["sandbox_dir"] = str(plan_files.sandbox_dir)
+    output["original_plan_file"] = str(plan_files.original_plan_file)
+    output["workspace_dir"] = (
+        str(plan_files.workspace_dir) if plan_files.workspace_dir is not None else None
+    )
+    output["sandbox_dir"] = (
+        str(plan_files.sandbox_dir) if plan_files.sandbox_dir is not None else None
+    )
     if selection.warning is not None:
         output["warning"] = selection.warning
     if verbose:
@@ -531,14 +854,102 @@ def build_json_output(
     return output
 
 
+def build_execution_json_output(
+    plan_files: PlanFiles,
+    plan_state: PlanState,
+    result: ExecutionResult,
+    verbose: bool,
+) -> dict[str, Any]:
+    output = build_json_output(
+        plan_files,
+        plan_state,
+        result.selected_before,
+        verbose,
+    )
+    output["selected_before"] = (
+        result.selected_before.item.to_json_obj()
+        if result.selected_before.item is not None
+        else None
+    )
+    output["selected_after"] = (
+        result.selected_after.item.to_json_obj()
+        if result.selected_after.item is not None
+        else None
+    )
+    output["codex_returncode"] = result.codex_returncode
+    output["logs_dir"] = str(result.logs_dir)
+    output["harness_checks"] = [check.to_json_obj() for check in result.harness_checks]
+    if result.same_selection_warning is not None:
+        output["warning"] = result.same_selection_warning
+    return output
+
+
+def command_exit_code(result: ExecutionResult) -> int:
+    for check in result.harness_checks:
+        if check.returncode != 0:
+            return check.returncode
+    return result.codex_returncode
+
+
 def main() -> int:
     args = parse_args()
     original_plan_file = Path(args.plan_file)
 
     try:
+        if args.run_all:
+            raise PlanError("--run-all is not implemented yet.")
+        if args.execute_next:
+            print(
+                "--execute-next is deprecated; execution is now the default.",
+                file=sys.stderr,
+            )
         plan_files = prepare_plan_file(original_plan_file, args.copy_to_run_dir)
-        plan_state = load_plan_state_from_file(plan_files.plan_file)
+        raw_state = load_json_state(plan_files.plan_file)
+        plan_files = with_plan_state_context(plan_files, raw_state)
+        plan_state = validate_plan_state(raw_state)
         selection = select_next_item(plan_state, include_parents=args.include_parents)
+    except PlanError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.status or selection.item is None:
+        if args.json:
+            print(
+                json.dumps(
+                    build_json_output(plan_files, plan_state, selection, args.verbose),
+                    indent=2,
+                )
+            )
+        else:
+            print_human_output(plan_files, plan_state, selection, args.verbose)
+        return 0
+
+    if args.dry_run_prompt:
+        if args.json:
+            output = build_json_output(plan_files, plan_state, selection, args.verbose)
+            output["dry_run_prompt"] = (
+                build_codex_prompt(plan_files.plan_file, selection.item.id)
+                if selection.item is not None
+                else None
+            )
+            print(json.dumps(output, indent=2))
+        else:
+            print_human_output(plan_files, plan_state, selection, args.verbose)
+            if selection.item is not None:
+                print()
+                print("Codex prompt:")
+                print(build_codex_prompt(plan_files.plan_file, selection.item.id), end="")
+        return 0
+
+    try:
+        plan_files = with_execution_run_dir(plan_files, plan_state.plan_id)
+        result = execute_next(
+            plan_files,
+            selection,
+            include_parents=args.include_parents,
+            codex_bin=args.codex_bin,
+        )
+        plan_state_after = load_plan_state_from_file(plan_files.plan_file)
     except PlanError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -546,14 +957,20 @@ def main() -> int:
     if args.json:
         print(
             json.dumps(
-                build_json_output(plan_files, plan_state, selection, args.verbose),
+                build_execution_json_output(plan_files, plan_state, result, args.verbose),
                 indent=2,
             )
         )
     else:
-        print_human_output(plan_files, plan_state, selection, args.verbose)
-
-    return 0
+        print_execution_output(
+            plan_files,
+            plan_state,
+            plan_state_after,
+            result,
+            args.codex_bin,
+            args.verbose,
+        )
+    return command_exit_code(result)
 
 
 if __name__ == "__main__":
