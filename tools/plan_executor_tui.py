@@ -7,7 +7,7 @@ from pathlib import Path
 
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -97,7 +97,7 @@ class PlanBrowseDialog(ModalScreen[Path | None]):
         self.dismiss(None)
 
 
-def render_recent_log_lines(lines: list[str], visible_count: int = 6) -> str:
+def render_recent_log_lines(lines: list[str], visible_count: int = 3) -> str:
     """Render the newest log lines in chronological order."""
     if visible_count <= 0:
         return ""
@@ -149,29 +149,35 @@ class PlanExecutorTui(App[None]):
     }
 
     #main {
-        height: 10;
+        height: 1fr;
     }
 
-    #progress {
+    #progress-panel {
         width: 42%;
+        height: 100%;
         border: round $accent;
         padding: 0 1;
     }
 
+    #progress {
+        height: auto;
+    }
+
     #selection {
         width: 58%;
+        height: 100%;
         border: round $accent;
         padding: 0 1;
     }
 
     #options {
-        height: 13;
+        height: 8;
         border: round $accent;
         padding: 0 1;
     }
 
     #log {
-        height: 1fr;
+        height: 5;
         border: round $accent;
         padding: 0 1;
     }
@@ -264,7 +270,10 @@ class PlanExecutorTui(App[None]):
                 id="paste-hint",
             )
         with Horizontal(id="main"):
-            yield Static("Progress\n\nNo plan loaded.", id="progress")
+            progress_panel = ScrollableContainer(id="progress-panel")
+            progress_panel.border_title = "Progress"
+            with progress_panel:
+                yield Static("No plan loaded.", id="progress")
             yield Static("Current Selection\n\nNo plan loaded.", id="selection")
         with Vertical(id="options"):
             with Horizontal(classes="option-row"):
@@ -337,8 +346,8 @@ class PlanExecutorTui(App[None]):
                     compact=True,
                 )
             yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
-            # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
-            yield Static("", id="command-preview")
+        # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
+        yield Static("", id="command-preview")
         log_widget = Static("", id="log")
         log_widget.border_title = "Log"
         yield log_widget
@@ -441,14 +450,14 @@ class PlanExecutorTui(App[None]):
         return True
 
     def render_progress(self, view: plan_executor.PlanStatusView) -> None:
-        lines = ["Progress", ""]
+        lines = []
         for item in view.items:
             indent = "  " if item.parent is not None else ""
             lines.append(f"{indent}{item.id} {item.status}")
         self.query_one("#progress", Static).update("\n".join(lines))
 
     def render_invalid_plan(self, error: str) -> None:
-        self.query_one("#progress", Static).update("Progress\n\nNo valid plan loaded.")
+        self.query_one("#progress", Static).update("No valid plan loaded.")
         self.query_one("#selection", Static).update(
             f"Current Selection\n\nFailed to load plan: {error}"
         )

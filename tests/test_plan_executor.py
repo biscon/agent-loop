@@ -194,6 +194,24 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
             self.assert_valid_plan_visible(app)
 
+    async def test_tui_progress_panel_contains_all_loaded_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "large.md"
+            write_plan(plan_file, base_state(phase_items(40)))
+
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, str(plan_file))
+                await self.click_load(pilot)
+
+                progress_panel = app.query_one("#progress-panel")
+                progress_text = str(
+                    progress_panel.query_one("#progress", self.Static).content
+                )
+
+        self.assertIn("phase_01 Not Started", progress_text)
+        self.assertIn("phase_40 Not Started", progress_text)
+
 
 def make_fake_codex(
     path: Path,
