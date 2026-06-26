@@ -40,6 +40,32 @@ Run the next selected item:
 python3 tools/plan_executor.py docs/my_plan.md
 ```
 
+Open the optional Textual TUI for status inspection and option setup:
+
+```bash
+python3 tools/plan_executor.py --tui
+```
+
+Textual is optional for normal CLI use. These commands work without installing
+Textual:
+
+```bash
+python3 tools/plan_executor.py docs/my_plan.md --status
+python3 tools/plan_executor.py docs/my_plan.md
+```
+
+Only TUI mode requires Textual:
+
+```bash
+pip install -r requirements.txt
+```
+
+or:
+
+```bash
+pip install textual
+```
+
 Run one pass, then review, fix once if needed, and commit if the final state passes:
 
 ```bash

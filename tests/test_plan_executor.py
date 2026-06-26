@@ -353,6 +353,99 @@ def local_exclude_path(repo: Path) -> Path:
 
 
 class PlanExecutorTests(unittest.TestCase):
+    def test_no_args_non_tty_does_not_launch_tui(self) -> None:
+        completed = subprocess.run(
+            CLI,
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("plan_file", completed.stderr)
+
+    def test_tui_flag_missing_textual_fails_cleanly(self) -> None:
+        def missing_textual() -> None:
+            raise ModuleNotFoundError("No module named 'textual'", name="textual")
+
+        with tempfile.TemporaryFile(mode="w+t") as stderr:
+            original_stderr = sys.stderr
+            try:
+                sys.stderr = stderr
+                returncode = plan_executor.launch_tui(runner_loader=missing_textual)
+            finally:
+                sys.stderr = original_stderr
+            stderr.seek(0)
+            output = stderr.read()
+
+        self.assertEqual(returncode, 1)
+        self.assertIn(
+            "TUI mode requires the 'textual' package. Install it with: pip install textual",
+            output,
+        )
+
+    def test_status_view_helper_selects_expected_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "plan.md"
+            write_plan(
+                plan_file,
+                base_state(
+                    [
+                        {
+                            "id": "phase_01",
+                            "title": "Done phase",
+                            "type": "phase",
+                            "status": "Completed",
+                        },
+                        {
+                            "id": "phase_02",
+                            "title": "Next phase",
+                            "type": "phase",
+                            "status": "Not Started",
+                        },
+                    ]
+                ),
+            )
+
+            view = plan_executor.build_plan_status_view(plan_file)
+
+        self.assertEqual(view.plan_id, "test_plan")
+        self.assertIsNotNone(view.selected)
+        self.assertEqual(view.selected.id, "phase_02")
+        self.assertEqual(view.selected.title, "Next phase")
+        self.assertEqual(view.selected.status, "Not Started")
+        self.assertEqual(view.suggested_prompt, f"Read {plan_file} and execute phase_02 only.")
+
+    def test_command_preview_for_tui_options(self) -> None:
+        preview = plan_executor.build_tui_command_preview(
+            "docs/my_plan.md",
+            plan_executor.TuiOptions(
+                run_all=True,
+                max_passes=3,
+                review_after_pass=True,
+            ),
+        )
+
+        self.assertEqual(
+            preview,
+            "python3 tools/plan_executor.py docs/my_plan.md --run-all --max-passes 3 --review-after-pass",
+        )
+
+    def test_normal_cli_status_path_works_without_textual(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "plan.md"
+            write_plan(plan_file, two_phase_state())
+
+            completed = subprocess.run(
+                CLI + [str(plan_file), "--status"],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Selected ID: phase_01", completed.stdout)
+
     def test_selects_phase_01_from_real_plan(self) -> None:
         plan_state = plan_executor.load_plan_state_from_file(REAL_PLAN)
         selection = plan_executor.select_next_item(plan_state, include_parents=False)

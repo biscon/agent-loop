@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,9 @@ SLEEP_INHIBITED_ENV = "PLAN_EXECUTOR_SLEEP_INHIBITED"
 SYSTEMD_INHIBIT_BIN_ENV = "PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"
 SYSTEMD_INHIBIT_MISSING_ERROR = (
     "--inhibit-sleep requested, but systemd-inhibit was not found."
+)
+TEXTUAL_MISSING_ERROR = (
+    "TUI mode requires the 'textual' package. Install it with: pip install textual"
 )
 
 
@@ -98,6 +102,31 @@ class PlanState:
     items_by_id: dict[str, PlanItem]
     children_by_parent: dict[str, list[PlanItem]]
     validation_details: list[str]
+
+
+@dataclass(frozen=True)
+class PlanStatusView:
+    plan_file: Path
+    plan_id: str
+    selected: PlanItem | None
+    selected_parent: PlanItem | None
+    items: list[PlanItem]
+    suggested_prompt: str | None
+    warning: str | None = None
+
+
+@dataclass(frozen=True)
+class TuiOptions:
+    run_all: bool = False
+    max_passes: int = 10
+    review_after_pass: bool = False
+    fix_after_review: bool = False
+    commit_after_pass: bool = False
+    commit_prefix: str = "plan"
+    copy_to_run_dir: bool = False
+    run_dir: str | None = None
+    inhibit_sleep: bool = False
+    codex_bin: str = "codex"
 
 
 @dataclass(frozen=True)
@@ -318,11 +347,16 @@ class RunAllRecord:
         return data
 
 
-def parse_args() -> argparse.Namespace:
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Select the first unfinished item from a markdown plan-state-json block."
     )
-    parser.add_argument("plan_file", help="Path to the markdown plan file.")
+    parser.add_argument("plan_file", nargs="?", help="Path to the markdown plan file.")
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Open the Textual terminal UI for status inspection and option setup.",
+    )
     parser.add_argument(
         "--copy-to-run-dir",
         nargs="?",
@@ -413,7 +447,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print extra validation details.",
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return create_parser().parse_args(argv)
 
 
 def find_systemd_inhibit() -> str | None:
@@ -558,6 +596,53 @@ def load_json_state(plan_file: Path) -> dict[str, Any]:
 
 def load_plan_state_from_file(plan_file: Path) -> PlanState:
     return validate_plan_state(load_json_state(plan_file))
+
+
+def build_plan_status_view(plan_file: Path, include_parents: bool = False) -> PlanStatusView:
+    plan_state = load_plan_state_from_file(plan_file)
+    selection = select_next_item(plan_state, include_parents=include_parents)
+    selected = selection.item
+    selected_parent = None
+    suggested_prompt = None
+    if selected is not None:
+        if selected.parent is not None:
+            selected_parent = plan_state.items_by_id[selected.parent]
+        suggested_prompt = f"Read {plan_file} and execute {selected.id} only."
+    return PlanStatusView(
+        plan_file=plan_file,
+        plan_id=plan_state.plan_id,
+        selected=selected,
+        selected_parent=selected_parent,
+        items=plan_state.items,
+        suggested_prompt=suggested_prompt,
+        warning=selection.warning,
+    )
+
+
+def build_tui_command_preview(plan_path: str, options: TuiOptions) -> str:
+    argv = ["python3", "tools/plan_executor.py"]
+    if plan_path:
+        argv.append(plan_path)
+    if options.run_all:
+        argv.append("--run-all")
+        argv.extend(["--max-passes", str(options.max_passes)])
+    if options.review_after_pass:
+        argv.append("--review-after-pass")
+    if options.fix_after_review:
+        argv.append("--fix-after-review")
+    if options.commit_after_pass:
+        argv.append("--commit-after-pass")
+    if options.commit_prefix != "plan":
+        argv.extend(["--commit-prefix", options.commit_prefix])
+    if options.copy_to_run_dir:
+        argv.append("--copy-to-run-dir")
+        if options.run_dir:
+            argv.append(options.run_dir)
+    if options.inhibit_sleep:
+        argv.append("--inhibit-sleep")
+    if options.codex_bin != "codex":
+        argv.extend(["--codex-bin", options.codex_bin])
+    return shlex.join(argv)
 
 
 def selection_to_json_obj(selection: Selection) -> dict[str, Any]:
@@ -2743,8 +2828,43 @@ def run_all(
     return 1
 
 
-def main() -> int:
-    args = parse_args()
+def load_tui_runner() -> Any:
+    try:
+        from plan_executor_tui import run_tui
+    except ModuleNotFoundError as exc:
+        if exc.name != "plan_executor_tui":
+            raise
+        from tools.plan_executor_tui import run_tui
+    return run_tui
+
+
+def launch_tui(initial_plan_path: str | None = None, runner_loader: Any = load_tui_runner) -> int:
+    try:
+        run_tui = runner_loader()
+    except ModuleNotFoundError as exc:
+        if exc.name is not None and (
+            exc.name == "textual" or exc.name.startswith("textual.")
+        ):
+            print(TEXTUAL_MISSING_ERROR, file=sys.stderr)
+            return 1
+        raise
+    return int(run_tui(initial_plan_path) or 0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(raw_argv)
+
+    if args.tui:
+        return launch_tui(args.plan_file)
+    if args.plan_file is None:
+        parser = create_parser()
+        if not raw_argv and sys.stdin.isatty() and sys.stdout.isatty():
+            return launch_tui()
+        parser.print_usage(sys.stderr)
+        print("plan_executor.py: error: the following arguments are required: plan_file", file=sys.stderr)
+        return 2
+
     original_plan_file = Path(args.plan_file)
 
     try:
