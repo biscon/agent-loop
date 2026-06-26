@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -34,6 +35,7 @@ except ImportError:
 
 MAX_RAW_OUTPUT_LINES = 5000
 RAW_OUTPUT_TRUNCATION_TEXT = "[output truncated: oldest lines dropped]"
+TUI_RESULT_JSON_PATH = plan_executor.DEFAULT_RUNS_DIR / "tui-latest-run-result.json"
 
 
 class PlanBrowseDialog(ModalScreen[Path | None]):
@@ -189,6 +191,83 @@ class LastRunResult:
     return_code: int | None = None
     failure_message: str | None = None
     reload_error: str | None = None
+
+
+@dataclass
+class LatestRunMetadata:
+    result_json_path: str
+    plan_file: str | None = None
+    original_plan_file: str | None = None
+    run_dir: str | None = None
+    logs_dir: str | None = None
+    review_requested: bool | None = None
+    fix_after_review_requested: bool | None = None
+    review_result_md: str | None = None
+    review_result_json: str | None = None
+    review_after_fix_result_md: str | None = None
+    review_after_fix_result_json: str | None = None
+    load_error: str | None = None
+
+
+def load_latest_run_metadata(path: Path) -> LatestRunMetadata:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return LatestRunMetadata(
+            result_json_path=str(path),
+            load_error=f"failed to read result metadata: {exc}",
+        )
+    except json.JSONDecodeError as exc:
+        return LatestRunMetadata(
+            result_json_path=str(path),
+            load_error=f"failed to parse result metadata: {exc}",
+        )
+    if not isinstance(raw, dict):
+        return LatestRunMetadata(
+            result_json_path=str(path),
+            load_error="result metadata root is not an object",
+        )
+    return LatestRunMetadata(
+        result_json_path=str(path),
+        plan_file=raw.get("plan_file") if isinstance(raw.get("plan_file"), str) else None,
+        original_plan_file=(
+            raw.get("original_plan_file")
+            if isinstance(raw.get("original_plan_file"), str)
+            else None
+        ),
+        run_dir=raw.get("run_dir") if isinstance(raw.get("run_dir"), str) else None,
+        logs_dir=raw.get("logs_dir") if isinstance(raw.get("logs_dir"), str) else None,
+        review_requested=(
+            raw.get("review_requested")
+            if isinstance(raw.get("review_requested"), bool)
+            else None
+        ),
+        fix_after_review_requested=(
+            raw.get("fix_after_review_requested")
+            if isinstance(raw.get("fix_after_review_requested"), bool)
+            else None
+        ),
+        review_result_md=(
+            raw.get("review_result_md")
+            if isinstance(raw.get("review_result_md"), str)
+            else None
+        ),
+        review_result_json=(
+            raw.get("review_result_json")
+            if isinstance(raw.get("review_result_json"), str)
+            else None
+        ),
+        review_after_fix_result_md=(
+            raw.get("review_after_fix_result_md")
+            if isinstance(raw.get("review_after_fix_result_md"), str)
+            else None
+        ),
+        review_after_fix_result_json=(
+            raw.get("review_after_fix_result_json")
+            if isinstance(raw.get("review_after_fix_result_json"), str)
+            else None
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -617,6 +696,8 @@ class PlanExecutorTui(App[None]):
         self.current_run_started_at: datetime | None = None
         self.active_run: ActiveRunSnapshot | None = None
         self.last_run_result: LastRunResult | None = None
+        self.latest_run_metadata: LatestRunMetadata | None = None
+        self.current_result_json_path: Path | None = None
         self.current_load_error: str | None = None
         self.elapsed_refresh_timer: Any | None = None
         self.raw_output_state = RawOutputState()
@@ -848,8 +929,10 @@ class PlanExecutorTui(App[None]):
         self.run_in_progress = True
         self.quit_after_run = False
         self.last_run_result = None
+        self.latest_run_metadata = None
         self.current_load_error = None
         self.current_run_selected_id = selected_id
+        self.current_result_json_path = TUI_RESULT_JSON_PATH
         started_at = datetime.now()
         self.current_run_started_at = started_at
         self.active_run = ActiveRunSnapshot(
@@ -863,7 +946,12 @@ class PlanExecutorTui(App[None]):
         self.update_run_status(f"Running {selected_id}")
         self.update_control_state()
         self.run_worker(
-            self.run_selected_pass(plan_path, selected_id, options),
+            self.run_selected_pass(
+                plan_path,
+                selected_id,
+                options,
+                self.current_result_json_path,
+            ),
             name="run-pass",
             exclusive=True,
         )
@@ -1049,10 +1137,13 @@ class PlanExecutorTui(App[None]):
         plan_path: str,
         selected_id: str,
         options: plan_executor.TuiOptions,
+        result_json_path: Path | None = None,
     ) -> None:
         return_code: int | None = None
         failed = False
         failure_message: str | None = None
+        result_json_path = result_json_path or TUI_RESULT_JSON_PATH
+        self.current_result_json_path = result_json_path
         if self.active_run is None:
             selected_title = selected_id
             if self.loaded_view is not None and self.loaded_view.selected is not None:
@@ -1067,7 +1158,11 @@ class PlanExecutorTui(App[None]):
             self.render_selection_panel()
         self.append_log(f"Starting pass {selected_id}.")
         try:
-            argv = plan_executor.build_tui_subprocess_argv(plan_path, options)
+            argv = plan_executor.build_tui_subprocess_argv(
+                plan_path,
+                options,
+                result_json_path=result_json_path,
+            )
             active_run = self.active_run
             selected_title = (
                 active_run.selected_title if active_run is not None else selected_id
@@ -1080,6 +1175,10 @@ class PlanExecutorTui(App[None]):
                 status="Running",
             )
             self.refresh_raw_output_view(auto_scroll=False)
+            try:
+                result_json_path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.append_log(f"Could not clear prior result metadata: {exc}")
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
@@ -1094,6 +1193,7 @@ class PlanExecutorTui(App[None]):
             )
             return_code = await process.wait()
             await asyncio.gather(stdout_task, stderr_task)
+            self.latest_run_metadata = load_latest_run_metadata(result_json_path)
             if return_code == 0:
                 self.update_run_status(f"Finished with return code {return_code}")
                 self.update_raw_output_status(f"Finished with return code {return_code}")
@@ -1126,6 +1226,7 @@ class PlanExecutorTui(App[None]):
             self.run_process = None
             self.current_run_selected_id = None
             self.current_run_started_at = None
+            self.current_result_json_path = None
             self.active_run = None
             try:
                 if self.load_plan(plan_path, log_load=False, preserve_last_run=True):

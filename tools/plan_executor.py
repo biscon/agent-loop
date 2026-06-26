@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -380,6 +381,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Print machine-readable JSON output.",
     )
     parser.add_argument(
+        "--result-json",
+        metavar="PATH",
+        help=(
+            "Write single-pass execution metadata JSON to PATH. "
+            "Only applies to normal single-pass execution."
+        ),
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Only parse, validate, and print the next item without executing Codex.",
@@ -684,12 +693,15 @@ def build_tui_subprocess_argv(
     *,
     python_executable: str = sys.executable,
     runner_path: Path | None = None,
+    result_json_path: Path | str | None = None,
 ) -> list[str]:
     runner = runner_path or Path(__file__).resolve()
     argv = [python_executable, str(runner)]
     if plan_path:
         argv.append(plan_path)
     argv.extend(build_tui_option_argv(options, include_run_all=False))
+    if result_json_path is not None:
+        argv.extend(["--result-json", str(result_json_path)])
     return argv
 
 
@@ -1246,6 +1258,32 @@ def write_text_file(path: Path, text: str) -> None:
 
 def write_json_file(path: Path, data: Any) -> None:
     write_text_file(path, json.dumps(data, indent=2) + "\n")
+
+
+def write_json_file_atomic(path: Path, data: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    except OSError as exc:
+        try:
+            if "temp_path" in locals() and temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+        raise PlanError(f"{path}: failed to write result metadata: {exc}") from exc
 
 
 def copy_plan_backup(source: Path, destination: Path) -> None:
@@ -2467,6 +2505,82 @@ def build_execution_json_output(
     return output
 
 
+def expected_review_artifact_path(
+    result: ExecutionResult,
+    review: ReviewResult | None,
+    filename: str,
+) -> str | None:
+    if review is None or not review.requested:
+        return None
+    if result.logs_dir is None:
+        return None
+    return str(result.logs_dir / filename)
+
+
+def build_single_pass_result_metadata(
+    plan_files: PlanFiles,
+    plan_state: PlanState,
+    result: ExecutionResult,
+    return_code: int,
+) -> dict[str, Any]:
+    output = build_execution_json_output(
+        plan_files,
+        plan_state,
+        result,
+        verbose=False,
+    )
+    review = result.review or ReviewResult.not_requested()
+    fix = result.fix or FixResult.not_requested()
+    review_after_fix = result.review_after_fix or ReviewResult.not_requested()
+    output.update(
+        {
+            "schema_version": 1,
+            "return_code": return_code,
+            "review_requested": review.requested,
+            "fix_after_review_requested": fix.requested,
+            "review_result_md": expected_review_artifact_path(
+                result,
+                review,
+                "review_result.md",
+            ),
+            "review_result_json": expected_review_artifact_path(
+                result,
+                review,
+                "review_result.json",
+            ),
+            "review_after_fix_result_md": expected_review_artifact_path(
+                result,
+                review_after_fix,
+                "review_after_fix_result.md",
+            ),
+            "review_after_fix_result_json": expected_review_artifact_path(
+                result,
+                review_after_fix,
+                "review_after_fix_result.json",
+            ),
+        }
+    )
+    return output
+
+
+def write_single_pass_result_metadata(
+    result_json_path: Path | None,
+    plan_files: PlanFiles,
+    plan_state: PlanState,
+    result: ExecutionResult,
+    return_code: int,
+) -> None:
+    metadata = build_single_pass_result_metadata(
+        plan_files,
+        plan_state,
+        result,
+        return_code,
+    )
+    write_json_file_atomic(result.logs_dir / "execution_summary.json", metadata)
+    if result_json_path is not None:
+        write_json_file_atomic(result_json_path, metadata)
+
+
 def command_exit_code(result: ExecutionResult) -> int:
     if result.review is not None and result.review.failed():
         recoverable_needs_fix = (
@@ -2929,6 +3043,8 @@ def main(argv: list[str] | None = None) -> int:
             raise PlanError("--run-all cannot be used with --dry-run-prompt")
         if args.run_all and args.json:
             raise PlanError("--run-all --json is not implemented yet.")
+        if args.run_all and args.result_json:
+            raise PlanError("--run-all cannot be used with --result-json")
         if args.fix_after_review and not args.review_after_pass:
             raise PlanError("--fix-after-review requires --review-after-pass")
         if args.fix_after_review and args.max_fix_attempts != 1:
@@ -3059,6 +3175,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
+    exit_code = command_exit_code(result)
+    try:
+        write_single_pass_result_metadata(
+            Path(args.result_json) if args.result_json else None,
+            plan_files,
+            plan_state,
+            result,
+            exit_code,
+        )
+    except PlanError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     if args.json:
         print(
             json.dumps(
@@ -3075,7 +3204,7 @@ def main(argv: list[str] | None = None) -> int:
             args.codex_bin,
             args.verbose,
         )
-    return command_exit_code(result)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -632,6 +632,119 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
+    async def test_tui_run_pass_argv_includes_result_json_and_loads_metadata(self) -> None:
+        captured_args = []
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured_args.extend(args)
+            result_path = Path(args[args.index("--result-json") + 1])
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "plan_file": VALID_TUI_PLAN,
+                        "original_plan_file": VALID_TUI_PLAN,
+                        "run_dir": ".agent-runs/in-place-test",
+                        "logs_dir": ".agent-runs/in-place-test/logs/phase_01",
+                        "review_requested": True,
+                        "fix_after_review_requested": False,
+                        "review_result_md": ".agent-runs/in-place-test/logs/phase_01/review_result.md",
+                        "review_result_json": ".agent-runs/in-place-test/logs/phase_01/review_result.json",
+                        "review_after_fix_result_md": None,
+                        "review_after_fix_result_json": None,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return self.FakeProcess(0, self.fake_stream(), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                self.assertIn("--result-json", captured_args)
+                result_path = Path(captured_args[captured_args.index("--result-json") + 1])
+                self.assertEqual(result_path, self.plan_executor_tui.TUI_RESULT_JSON_PATH)
+                self.assertIsNotNone(app.latest_run_metadata)
+                self.assertIsNone(app.latest_run_metadata.load_error)
+                self.assertEqual(app.latest_run_metadata.logs_dir, ".agent-runs/in-place-test/logs/phase_01")
+                self.assertTrue(app.latest_run_metadata.review_requested)
+                self.assertEqual(
+                    app.latest_run_metadata.review_result_json,
+                    ".agent-runs/in-place-test/logs/phase_01/review_result.json",
+                )
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_missing_result_json_stores_metadata_error(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            self.assertIn("--result-json", args)
+            return self.FakeProcess(0, self.fake_stream(), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                self.assertIsNotNone(app.latest_run_metadata)
+                self.assertIn("failed to read result metadata", app.latest_run_metadata.load_error)
+                self.assertFalse(app.run_in_progress)
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_invalid_result_json_stores_metadata_error_without_stdout_parse(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            result_path = Path(args[args.index("--result-json") + 1])
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text("{not json\n", encoding="utf-8")
+            return self.FakeProcess(
+                0,
+                self.fake_stream("Logs dir: .agent-runs/fake/logs/phase_01\n"),
+                self.fake_stream(),
+            )
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                self.assertIsNotNone(app.latest_run_metadata)
+                self.assertIn("failed to parse result metadata", app.latest_run_metadata.load_error)
+                self.assertIsNone(app.latest_run_metadata.logs_dir)
+                self.assertIn("Logs dir: .agent-runs/fake/logs/phase_01", self.raw_output_text(app))
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
     async def test_tui_fake_subprocess_output_appears_only_in_raw_output(self) -> None:
         async def fake_create_subprocess_exec(*args, **kwargs):
             return self.FakeProcess(
@@ -1395,6 +1508,34 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertNotIn("--tui", argv)
         self.assertNotIn("--run-all", argv)
 
+    def test_tui_subprocess_argv_includes_result_json_when_supplied(self) -> None:
+        argv = plan_executor.build_tui_subprocess_argv(
+            "docs/my_plan.md",
+            plan_executor.TuiOptions(),
+            python_executable="/usr/bin/python",
+            runner_path=Path("/repo/tools/plan_executor.py"),
+            result_json_path=Path(".agent-runs/tui-latest-run-result.json"),
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                "/usr/bin/python",
+                "/repo/tools/plan_executor.py",
+                "docs/my_plan.md",
+                "--result-json",
+                ".agent-runs/tui-latest-run-result.json",
+            ],
+        )
+
+    def test_command_preview_omits_result_json_metadata_path(self) -> None:
+        preview = plan_executor.build_tui_command_preview(
+            "docs/my_plan.md",
+            plan_executor.TuiOptions(),
+        )
+
+        self.assertNotIn("--result-json", preview)
+
     def test_tui_subprocess_argv_rejects_run_all(self) -> None:
         with self.assertRaisesRegex(
             plan_executor.PlanError,
@@ -1406,6 +1547,13 @@ class PlanExecutorTests(unittest.TestCase):
                 python_executable="/usr/bin/python",
                 runner_path=Path("/repo/tools/plan_executor.py"),
             )
+
+    def test_result_json_appears_in_parsed_args(self) -> None:
+        args = plan_executor.parse_args(
+            ["docs/my_plan.md", "--result-json", ".agent-runs/result.json"]
+        )
+
+        self.assertEqual(args.result_json, ".agent-runs/result.json")
 
     def test_find_docs_markdown_plans_returns_sorted_recursive_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1688,6 +1836,222 @@ class PlanExecutorTests(unittest.TestCase):
             self.assertTrue((logs_dir / "plan_before.md").exists())
             self.assertTrue((logs_dir / "plan_after.md").exists())
             self.assertFalse((tmp_path / "logs").exists())
+
+    def test_result_json_metadata_written_for_single_pass_with_review_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            result_path = tmp_path / "nested" / "latest-run-result.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, review_verdict="pass")
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--result-json",
+                    str(result_path),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(result_path.exists())
+            metadata = json.loads(result_path.read_text(encoding="utf-8"))
+            required_keys = {
+                "schema_version",
+                "plan_file",
+                "run_dir",
+                "logs_dir",
+                "selected_before",
+                "selected_after",
+                "return_code",
+                "review_requested",
+                "fix_after_review_requested",
+                "review_result_md",
+                "review_result_json",
+                "review_after_fix_result_md",
+                "review_after_fix_result_json",
+            }
+            self.assertTrue(required_keys.issubset(metadata.keys()))
+            self.assertEqual(metadata["schema_version"], 1)
+            self.assertEqual(metadata["plan_file"], str(plan_file))
+            self.assertEqual(metadata["original_plan_file"], str(plan_file))
+            self.assertEqual(metadata["return_code"], 0)
+            self.assertTrue(metadata["review_requested"])
+            self.assertFalse(metadata["fix_after_review_requested"])
+            logs_dir = tmp_path / metadata["logs_dir"]
+            self.assertEqual(
+                metadata["review_result_md"],
+                str(Path(metadata["logs_dir"]) / "review_result.md"),
+            )
+            self.assertEqual(
+                metadata["review_result_json"],
+                str(Path(metadata["logs_dir"]) / "review_result.json"),
+            )
+            self.assertIsNone(metadata["review_after_fix_result_md"])
+            self.assertIsNone(metadata["review_after_fix_result_json"])
+            self.assertEqual(
+                json.loads((logs_dir / "execution_summary.json").read_text(encoding="utf-8")),
+                metadata,
+            )
+
+    def test_result_json_metadata_uses_null_review_paths_without_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            result_path = tmp_path / "result.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--result-json",
+                    str(result_path),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            metadata = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertFalse(metadata["review_requested"])
+            self.assertFalse(metadata["fix_after_review_requested"])
+            self.assertIsNone(metadata["review_result_md"])
+            self.assertIsNone(metadata["review_result_json"])
+            self.assertIsNone(metadata["review_after_fix_result_md"])
+            self.assertIsNone(metadata["review_after_fix_result_json"])
+
+    def test_result_json_metadata_copy_mode_reports_active_and_original_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            original_plan = tmp_path / "plan.md"
+            run_dir = tmp_path / ".agent-runs" / "copy-run"
+            result_path = tmp_path / "result.json"
+            write_plan(original_plan, two_phase_state())
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(original_plan),
+                    "--copy-to-run-dir",
+                    str(run_dir),
+                    "--result-json",
+                    str(result_path),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            metadata = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["mode"], "copy")
+            self.assertEqual(metadata["plan_file"], str(run_dir / "plan.md"))
+            self.assertEqual(metadata["original_plan_file"], str(original_plan))
+            self.assertEqual(metadata["run_dir"], str(run_dir))
+
+    def test_result_json_write_failure_returns_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            result_parent = tmp_path / "not-a-directory"
+            result_parent.write_text("not a directory\n", encoding="utf-8")
+            write_plan(plan_file, two_phase_state())
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--result-json",
+                    str(result_parent / "result.json"),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("failed to write result metadata", completed.stderr)
+
+    def test_execution_summary_write_failure_is_fatal(self) -> None:
+        selected = plan_executor.Selection(
+            plan_executor.PlanItem("phase_01", "Create sandbox", "phase", "Not Started")
+        )
+        result = plan_executor.ExecutionResult(
+            selected_before=selected,
+            selected_after=selected,
+            codex_returncode=0,
+            logs_dir=Path("logs"),
+            plan_backup_before=Path("logs/plan_before.md"),
+            plan_backup_after=Path("logs/plan_after.md"),
+            harness_checks=[],
+            prompt="",
+            review=plan_executor.ReviewResult.not_requested(),
+            fix=plan_executor.FixResult.not_requested(),
+            review_after_fix=plan_executor.ReviewResult.not_requested(),
+        )
+        plan_files = plan_executor.PlanFiles(
+            original_plan_file=Path("plan.md"),
+            plan_file=Path("plan.md"),
+            mode="in-place",
+            run_dir=Path(".agent-runs/run"),
+        )
+        plan_state = plan_executor.PlanState(
+            plan_id="test_plan",
+            items=[selected.item],
+            items_by_id={selected.item.id: selected.item},
+            children_by_parent={},
+            validation_details=[],
+        )
+
+        original_writer = plan_executor.write_json_file_atomic
+
+        def fail_summary(path: Path, data) -> None:
+            if path.name == "execution_summary.json":
+                raise plan_executor.PlanError("summary write failed")
+            original_writer(path, data)
+
+        try:
+            plan_executor.write_json_file_atomic = fail_summary
+            with self.assertRaisesRegex(plan_executor.PlanError, "summary write failed"):
+                plan_executor.write_single_pass_result_metadata(
+                    Path("result.json"),
+                    plan_files,
+                    plan_state,
+                    result,
+                    0,
+                )
+        finally:
+            plan_executor.write_json_file_atomic = original_writer
 
     def test_status_does_not_call_codex(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2446,6 +2810,30 @@ class PlanExecutorTests(unittest.TestCase):
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("--run-all --json is not implemented yet.", completed.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_run_all_disallows_result_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_codex = Path(tmp) / "fake_codex.py"
+            marker = Path(tmp) / "marker.json"
+            make_fake_codex(fake_codex, marker)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(REAL_PLAN),
+                    "--run-all",
+                    "--result-json",
+                    str(Path(tmp) / "result.json"),
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("--run-all cannot be used with --result-json", completed.stderr)
             self.assertFalse(marker.exists())
 
     def test_run_all_writes_summary_logs(self) -> None:
