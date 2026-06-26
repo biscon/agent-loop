@@ -145,6 +145,8 @@ class ExecutionResult:
     prompt: str
     same_selection_warning: str | None = None
     review: "ReviewResult | None" = None
+    fix: "FixResult | None" = None
+    review_after_fix: "ReviewResult | None" = None
     commit: "CommitResult | None" = None
 
 
@@ -170,25 +172,68 @@ class ReviewResult:
     def failed(self) -> bool:
         return self.requested and self.stop_reason is not None
 
-    def to_json_obj(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"review_requested": self.requested}
+    def to_json_obj(self, prefix: str = "review") -> dict[str, Any]:
+        data: dict[str, Any] = {f"{prefix}_requested": self.requested}
         if not self.requested:
             return data
         data.update(
             {
-                "review_attempted": self.attempted,
-                "review_returncode": self.returncode,
-                "review_verdict": self.verdict,
-                "review_summary": self.summary,
-                "review_result_json": (
+                f"{prefix}_attempted": self.attempted,
+                f"{prefix}_returncode": self.returncode,
+                f"{prefix}_verdict": self.verdict,
+                f"{prefix}_summary": self.summary,
+                f"{prefix}_result_json": (
                     str(self.result_json_path) if self.result_json_path is not None else None
                 ),
-                "review_result_md": (
+                f"{prefix}_result_md": (
                     str(self.result_md_path) if self.result_md_path is not None else None
                 ),
-                "review_stop_reason": self.stop_reason,
+                f"{prefix}_stop_reason": self.stop_reason,
             }
         )
+        return data
+
+
+@dataclass(frozen=True)
+class FixResult:
+    requested: bool
+    attempted: bool = False
+    returncode: int | None = None
+    result_md_path: Path | None = None
+    harness_checks: list[HarnessCheck] | None = None
+    harness_checks_passed: bool | None = None
+    stop_reason: str | None = None
+
+    @classmethod
+    def not_requested(cls) -> "FixResult":
+        return cls(requested=False)
+
+    @classmethod
+    def not_attempted(cls, reason: str | None = None) -> "FixResult":
+        return cls(requested=True, attempted=False, stop_reason=reason)
+
+    def failed(self) -> bool:
+        return self.requested and self.stop_reason is not None
+
+    def to_json_obj(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"fix_requested": self.requested}
+        if not self.requested:
+            return data
+        data.update(
+            {
+                "fix_attempted": self.attempted,
+                "fix_returncode": self.returncode,
+                "fix_result_md": (
+                    str(self.result_md_path) if self.result_md_path is not None else None
+                ),
+                "fix_harness_checks_passed": self.harness_checks_passed,
+                "fix_stop_reason": self.stop_reason,
+            }
+        )
+        if self.harness_checks is not None:
+            data["fix_harness_checks"] = [
+                check.to_json_obj() for check in self.harness_checks
+            ]
         return data
 
 
@@ -241,6 +286,8 @@ class RunAllRecord:
     selected_after_title: str | None = None
     selected_item_post_status: str | None = None
     review: ReviewResult | None = None
+    fix: FixResult | None = None
+    review_after_fix: ReviewResult | None = None
     commit: CommitResult | None = None
 
     def to_json_obj(self) -> dict[str, Any]:
@@ -255,6 +302,12 @@ class RunAllRecord:
             "selected_item_post_status": self.selected_item_post_status,
         }
         data.update((self.review or ReviewResult.not_requested()).to_json_obj())
+        data.update((self.fix or FixResult.not_requested()).to_json_obj())
+        data.update(
+            (self.review_after_fix or ReviewResult.not_requested()).to_json_obj(
+                "review_after_fix"
+            )
+        )
         data.update((self.commit or CommitResult.not_requested()).to_json_obj())
         return data
 
@@ -317,6 +370,17 @@ def parse_args() -> argparse.Namespace:
         "--review-after-pass",
         action="store_true",
         help="Run a read-only agent review after each successful executed pass.",
+    )
+    parser.add_argument(
+        "--fix-after-review",
+        action="store_true",
+        help="After a needs_fix review verdict, run one bounded fix pass and rereview.",
+    )
+    parser.add_argument(
+        "--max-fix-attempts",
+        type=positive_int,
+        default=1,
+        help="Maximum fix attempts for --fix-after-review. V2.8 supports only 1.",
     )
     parser.add_argument(
         "--commit-prefix",
@@ -786,10 +850,43 @@ def build_review_prompt(
     selected_item: PlanItem,
     status_after: str,
     logs_dir: Path,
+    *,
+    after_fix: bool = False,
 ) -> str:
-    result_json = logs_dir / "review_result.json"
-    result_md = logs_dir / "review_result.md"
-    return f"""Review the implementation diff for the selected plan item only.
+    result_json = logs_dir / (
+        "review_after_fix_result.json" if after_fix else "review_result.json"
+    )
+    result_md = logs_dir / (
+        "review_after_fix_result.md" if after_fix else "review_result.md"
+    )
+    heading = (
+        "Rereview the selected plan item after one fix attempt."
+        if after_fix
+        else "Review the implementation diff for the selected plan item only."
+    )
+    fix_artifacts = ""
+    extra_instructions = ""
+    if after_fix:
+        fix_artifacts = f"""
+- {logs_dir / "fix_prompt.txt"}
+- {logs_dir / "fix_stdout.txt"}
+- {logs_dir / "fix_stderr.txt"}
+- {logs_dir / "fix_returncode.txt"}
+- {logs_dir / "fix_result.md"}
+- {logs_dir / "fix_harness_checks.json"}
+- {logs_dir / "plan_before_fix.md"}
+- {logs_dir / "plan_after_fix.md"}
+- {logs_dir / "fix_git_status_before.txt"}
+- {logs_dir / "fix_git_status_after.txt"}
+- {logs_dir / "fix_git_diff_stat_before.txt"}
+- {logs_dir / "fix_git_diff_stat_after.txt"}
+- {logs_dir / "fix_git_name_status_after.txt"}"""
+        extra_instructions = """
+This is a rereview after one bounded fix attempt.
+Confirm whether the original review issues were addressed.
+Look for regressions introduced by the fix.
+"""
+    return f"""{heading}
 
 Active plan file: {plan_file}
 Selected item id: {selected_item.id}
@@ -812,11 +909,13 @@ Read the active plan file and these per-pass artifacts:
 - {logs_dir / "implementation_git_diff_after.patch"}
 - {logs_dir / "implementation_git_diff_stat_after.txt"}
 - {logs_dir / "implementation_git_name_status_after.txt"}
+{fix_artifacts}
 
 Inspect the current git diff and changed files as needed.
 
 The current git diff may include changes from earlier uncommitted passes.
 Use the before/after implementation snapshots and plan_before/plan_after to focus on the selected item for this pass.
+{extra_instructions}
 
 Verify scope discipline:
 - Did the changes match the selected plan item?
@@ -863,6 +962,83 @@ Issue objects must use this shape:
 Allowed issue severities: blocker, major, minor.
 
 Also write a human-readable review report to {result_md}.
+"""
+
+
+def build_fix_prompt(
+    plan_file: Path,
+    selected_item: PlanItem,
+    logs_dir: Path,
+) -> str:
+    diff = run_git_command(["git", "diff", "--binary"])
+    diff_stat = run_git_command(["git", "diff", "--stat"])
+    name_status = run_git_command(["git", "diff", "--name-status"])
+    result_md = logs_dir / "fix_result.md"
+    return f"""Fix only issues listed in the review result.
+
+Active plan file: {plan_file}
+Selected item id: {selected_item.id}
+Selected item title: {selected_item.title}
+Selected item type: {selected_item.type}
+Logs dir: {logs_dir}
+
+Review result paths:
+- {logs_dir / "review_result.json"}
+- {logs_dir / "review_result.md"}
+
+Implementation artifacts:
+- {logs_dir / "codex_prompt.txt"}
+- {logs_dir / "codex_stdout.txt"}
+- {logs_dir / "codex_stderr.txt"}
+- {logs_dir / "harness_checks.json"}
+- {logs_dir / "selection_before.json"}
+- {logs_dir / "selection_after.json"}
+- {logs_dir / "plan_before.md"}
+- {logs_dir / "plan_after.md"}
+- {logs_dir / "implementation_git_status_before.txt"}
+- {logs_dir / "implementation_git_diff_before.patch"}
+- {logs_dir / "implementation_git_diff_stat_before.txt"}
+- {logs_dir / "implementation_git_status_after.txt"}
+- {logs_dir / "implementation_git_diff_after.patch"}
+- {logs_dir / "implementation_git_diff_stat_after.txt"}
+- {logs_dir / "implementation_git_name_status_after.txt"}
+
+Rules:
+- Fix only issues listed in the review result.
+- Do not broaden the selected plan item.
+- Do not start the next phase/pass.
+- Do not refactor unrelated code.
+- Do not update unrelated plan sections.
+- Do not commit.
+- Do not push.
+- Do not use gh.
+- Do not create branches.
+- Do not run interactive Codex/TUI.
+- If the review issue is not safely fixable, write a short explanation to {result_md} and exit without making risky changes.
+
+The active plan may be updated only if the review issue specifically concerns the selected item's plan update, status note, verification note, or behavior note.
+Do not mark a new phase/pass complete.
+
+Current git diff stat:
+```text
+{diff_stat.stdout}
+```
+
+Current git name-status:
+```text
+{name_status.stdout}
+```
+
+Current git diff:
+```diff
+{diff.stdout}
+```
+
+Write a human-readable fix report to {result_md} with:
+- summary of what was fixed
+- files changed
+- any issues intentionally left unresolved
+- verification commands run, if any
 """
 
 
@@ -932,6 +1108,22 @@ def write_implementation_git_snapshots(logs_dir: Path, suffix: str) -> None:
     if suffix == "after":
         write_git_command_output(
             logs_dir / "implementation_git_name_status_after.txt",
+            ["git", "diff", "--name-status"],
+        )
+
+
+def write_fix_git_snapshots(logs_dir: Path, suffix: str) -> None:
+    write_git_command_output(
+        logs_dir / f"fix_git_status_{suffix}.txt",
+        ["git", "status", "--porcelain"],
+    )
+    write_git_command_output(
+        logs_dir / f"fix_git_diff_stat_{suffix}.txt",
+        ["git", "diff", "--stat"],
+    )
+    if suffix == "after":
+        write_git_command_output(
+            logs_dir / "fix_git_name_status_after.txt",
             ["git", "diff", "--name-status"],
         )
 
@@ -1055,6 +1247,50 @@ def selected_item_status_after(
     return item.status if item is not None else None
 
 
+def validate_post_fix_plan_scope(
+    before_fix: PlanState,
+    after_fix: PlanState,
+    selected_before: Selection,
+) -> str | None:
+    if selected_before.item is None:
+        return "fix_broadened_scope"
+    selected_id = selected_before.item.id
+    before_selected = before_fix.items_by_id.get(selected_id)
+    after_selected = after_fix.items_by_id.get(selected_id)
+    if before_selected is None or after_selected is None:
+        return "fix_invalid_selected_status"
+    if after_selected.status not in DONE_STATUSES:
+        return "fix_invalid_selected_status"
+
+    if (
+        before_selected.id != after_selected.id
+        or before_selected.title != after_selected.title
+        or before_selected.type != after_selected.type
+        or before_selected.parent != after_selected.parent
+    ):
+        return "fix_broadened_scope"
+
+    before_children = {
+        child.id for child in before_fix.children_by_parent.get(selected_id, [])
+    }
+    after_children = {
+        child.id for child in after_fix.children_by_parent.get(selected_id, [])
+    }
+    if after_children - before_children:
+        return "fix_broadened_scope"
+
+    for item_id, before_item in before_fix.items_by_id.items():
+        if item_id == selected_id:
+            continue
+        after_item = after_fix.items_by_id.get(item_id)
+        if after_item is None:
+            return "fix_broadened_scope"
+        if before_item.status not in DONE_STATUSES and after_item.status in DONE_STATUSES:
+            return "fix_broadened_scope"
+
+    return None
+
+
 def commit_subject(prefix: str, selected_item: PlanItem) -> str:
     return f"{prefix}: complete {selected_item.id} - {selected_item.title}"
 
@@ -1065,6 +1301,8 @@ def commit_body(
     status_after: str,
     logs_dir: Path,
     review: ReviewResult | None,
+    fix: FixResult | None,
+    review_after_fix: ReviewResult | None,
 ) -> str:
     lines = [
         "Automated plan executor pass.",
@@ -1075,6 +1313,8 @@ def commit_body(
         f"Logs: {logs_dir}",
     ]
     review = review or ReviewResult.not_requested()
+    fix = fix or FixResult.not_requested()
+    review_after_fix = review_after_fix or ReviewResult.not_requested()
     lines.extend(
         [
             f"Review requested: {review.requested}",
@@ -1082,6 +1322,16 @@ def commit_body(
             f"Review summary: {review.summary}",
             f"Review result JSON: {review.result_json_path}",
             f"Review result MD: {review.result_md_path}",
+            f"Fix requested: {fix.requested}",
+            f"Fix attempted: {fix.attempted}",
+            f"Fix return code: {fix.returncode}",
+            f"Fix stop reason: {fix.stop_reason}",
+            f"Fix result MD: {fix.result_md_path}",
+            f"Review after fix requested: {review_after_fix.requested}",
+            f"Review after fix verdict: {review_after_fix.verdict}",
+            f"Review after fix summary: {review_after_fix.summary}",
+            f"Review after fix result JSON: {review_after_fix.result_json_path}",
+            f"Review after fix result MD: {review_after_fix.result_md_path}",
         ]
     )
     return "\n".join(lines)
@@ -1248,6 +1498,8 @@ def attempt_git_commit(
         status_after or "",
         logs_dir,
         result.review,
+        result.fix,
+        result.review_after_fix,
     )
     commit = run_git_command(["git", "commit", "-m", subject, "-m", body])
     write_command_output(logs_dir / "git_commit_stdout.txt", commit.stdout)
@@ -1307,7 +1559,21 @@ def apply_commit_if_eligible(
         return replace(result, commit=commit_not_eligible("harness failed"))
 
     if result.review is not None and result.review.requested:
-        if result.review.verdict != "pass" or result.review.stop_reason is not None:
+        review_passed_directly = (
+            result.review.verdict == "pass" and result.review.stop_reason is None
+        )
+        review_passed_after_fix = (
+            result.review.verdict == "needs_fix"
+            and result.fix is not None
+            and result.fix.requested
+            and result.fix.attempted
+            and result.fix.stop_reason is None
+            and result.fix.harness_checks_passed is True
+            and result.review_after_fix is not None
+            and result.review_after_fix.verdict == "pass"
+            and result.review_after_fix.stop_reason is None
+        )
+        if not (review_passed_directly or review_passed_after_fix):
             return replace(result, commit=commit_not_eligible("review did not pass"))
 
     status_after = selected_item_status_after(plan_state_after, result.selected_before)
@@ -1411,25 +1677,36 @@ def run_review_after_pass(
     result: ExecutionResult,
     plan_state_after: PlanState,
     codex_bin: str,
+    *,
+    after_fix: bool = False,
 ) -> ExecutionResult:
     selected_item = result.selected_before.item
     if selected_item is None:
-        return replace(result, review=ReviewResult.not_attempted("no selected item"))
+        review = ReviewResult.not_attempted("no selected item")
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
     status_after = selected_item_status_after(plan_state_after, result.selected_before)
     if status_after not in DONE_STATUSES:
-        return replace(result, review=ReviewResult.not_attempted("selected item not completed"))
+        review = ReviewResult.not_attempted("selected item not completed")
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
     logs_dir = result.logs_dir
-    result_json_path = logs_dir / "review_result.json"
-    result_md_path = logs_dir / "review_result.md"
-    prompt = build_review_prompt(plan_files.plan_file, selected_item, status_after, logs_dir)
-    write_text_file(logs_dir / "review_prompt.txt", prompt)
+    prefix = "review_after_fix" if after_fix else "review"
+    result_json_path = logs_dir / f"{prefix}_result.json"
+    result_md_path = logs_dir / f"{prefix}_result.md"
+    prompt = build_review_prompt(
+        plan_files.plan_file,
+        selected_item,
+        status_after,
+        logs_dir,
+        after_fix=after_fix,
+    )
+    write_text_file(logs_dir / f"{prefix}_prompt.txt", prompt)
 
     fingerprint_before, status_before, _diff_before = git_worktree_fingerprint()
-    write_command_output(logs_dir / "review_git_status_before.txt", status_before)
+    write_command_output(logs_dir / f"{prefix}_git_status_before.txt", status_before)
     write_review_fingerprint(
-        logs_dir / "review_git_diff_fingerprint_before.txt",
+        logs_dir / f"{prefix}_git_diff_fingerprint_before.txt",
         fingerprint_before,
     )
 
@@ -1441,11 +1718,11 @@ def run_review_after_pass(
             stderr_prefix="[review:stderr] ",
         )
     except OSError as exc:
-        write_text_file(logs_dir / "review_error.txt", str(exc) + "\n")
+        write_text_file(logs_dir / f"{prefix}_error.txt", str(exc) + "\n")
         fingerprint_after, status_after_text, _diff_after = git_worktree_fingerprint()
-        write_command_output(logs_dir / "review_git_status_after.txt", status_after_text)
+        write_command_output(logs_dir / f"{prefix}_git_status_after.txt", status_after_text)
         write_review_fingerprint(
-            logs_dir / "review_git_diff_fingerprint_after.txt",
+            logs_dir / f"{prefix}_git_diff_fingerprint_after.txt",
             fingerprint_after,
         )
         review = ReviewResult(
@@ -1455,16 +1732,16 @@ def run_review_after_pass(
             result_md_path=result_md_path,
             stop_reason="review_launch_failed",
         )
-        return replace(result, review=review)
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
-    write_text_file(logs_dir / "review_stdout.txt", stdout)
-    write_text_file(logs_dir / "review_stderr.txt", stderr)
-    write_text_file(logs_dir / "review_returncode.txt", f"{returncode}\n")
+    write_text_file(logs_dir / f"{prefix}_stdout.txt", stdout)
+    write_text_file(logs_dir / f"{prefix}_stderr.txt", stderr)
+    write_text_file(logs_dir / f"{prefix}_returncode.txt", f"{returncode}\n")
 
     fingerprint_after, status_after_text, _diff_after = git_worktree_fingerprint()
-    write_command_output(logs_dir / "review_git_status_after.txt", status_after_text)
+    write_command_output(logs_dir / f"{prefix}_git_status_after.txt", status_after_text)
     write_review_fingerprint(
-        logs_dir / "review_git_diff_fingerprint_after.txt",
+        logs_dir / f"{prefix}_git_diff_fingerprint_after.txt",
         fingerprint_after,
     )
 
@@ -1477,7 +1754,7 @@ def run_review_after_pass(
             result_md_path=result_md_path,
             stop_reason="review_modified_worktree",
         )
-        return replace(result, review=review)
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
     if returncode != 0:
         review = ReviewResult(
@@ -1488,12 +1765,12 @@ def run_review_after_pass(
             result_md_path=result_md_path,
             stop_reason="review_codex_failed",
         )
-        return replace(result, review=review)
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
     try:
         verdict, summary = parse_review_result_json(result_json_path)
     except PlanError as exc:
-        write_text_file(logs_dir / "review_parse_error.txt", str(exc) + "\n")
+        write_text_file(logs_dir / f"{prefix}_parse_error.txt", str(exc) + "\n")
         review = ReviewResult(
             requested=True,
             attempted=True,
@@ -1502,7 +1779,7 @@ def run_review_after_pass(
             result_md_path=result_md_path,
             stop_reason="review_invalid_json",
         )
-        return replace(result, review=review)
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
     if not result_md_path.exists():
         review = ReviewResult(
@@ -1515,9 +1792,16 @@ def run_review_after_pass(
             result_md_path=result_md_path,
             stop_reason="review_missing_markdown",
         )
-        return replace(result, review=review)
+        return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
 
-    stop_reason = None if verdict == "pass" else f"review_{verdict}"
+    stop_reason = None
+    if verdict != "pass":
+        if after_fix and verdict == "needs_fix":
+            stop_reason = "fix_incomplete"
+        elif after_fix and verdict == "needs_human":
+            stop_reason = "review_after_fix_needs_human"
+        else:
+            stop_reason = f"review_{verdict}"
     review = ReviewResult(
         requested=True,
         attempted=True,
@@ -1528,7 +1812,143 @@ def run_review_after_pass(
         result_md_path=result_md_path,
         stop_reason=stop_reason,
     )
-    return replace(result, review=review)
+    return replace(result, review_after_fix=review) if after_fix else replace(result, review=review)
+
+
+def run_fix_after_review(
+    plan_files: PlanFiles,
+    result: ExecutionResult,
+    plan_state_after: PlanState,
+    include_parents: bool,
+    codex_bin: str,
+) -> tuple[ExecutionResult, PlanState]:
+    selected_item = result.selected_before.item
+    if selected_item is None:
+        return replace(result, fix=FixResult.not_attempted("no selected item")), plan_state_after
+
+    logs_dir = result.logs_dir
+    result_md_path = logs_dir / "fix_result.md"
+    copy_plan_backup(plan_files.plan_file, logs_dir / "plan_before_fix.md")
+    before_fix_state = load_plan_state_from_file(logs_dir / "plan_before_fix.md")
+    write_fix_git_snapshots(logs_dir, "before")
+    prompt = build_fix_prompt(plan_files.plan_file, selected_item, logs_dir)
+    write_text_file(logs_dir / "fix_prompt.txt", prompt)
+
+    try:
+        fix_returncode, stdout, stderr = run_codex_exec(
+            codex_bin,
+            prompt,
+            stdout_prefix="[fix] ",
+            stderr_prefix="[fix:stderr] ",
+        )
+    except OSError as exc:
+        write_text_file(logs_dir / "fix_error.txt", str(exc) + "\n")
+        write_fix_git_snapshots(logs_dir, "after")
+        fix = FixResult(
+            requested=True,
+            attempted=True,
+            result_md_path=result_md_path,
+            stop_reason="fix_failed",
+        )
+        return replace(result, fix=fix), plan_state_after
+
+    write_text_file(logs_dir / "fix_stdout.txt", stdout)
+    write_text_file(logs_dir / "fix_stderr.txt", stderr)
+    write_text_file(logs_dir / "fix_returncode.txt", f"{fix_returncode}\n")
+    write_fix_git_snapshots(logs_dir, "after")
+
+    if fix_returncode != 0:
+        fix = FixResult(
+            requested=True,
+            attempted=True,
+            returncode=fix_returncode,
+            result_md_path=result_md_path,
+            stop_reason="fix_failed",
+        )
+        return replace(result, fix=fix), plan_state_after
+
+    copy_plan_backup(plan_files.plan_file, logs_dir / "plan_after_fix.md")
+    try:
+        after_fix_state = load_plan_state_from_file(plan_files.plan_file)
+    except PlanError as exc:
+        write_text_file(logs_dir / "fix_plan_parse_error.txt", str(exc) + "\n")
+        fix = FixResult(
+            requested=True,
+            attempted=True,
+            returncode=fix_returncode,
+            result_md_path=result_md_path,
+            stop_reason="fix_plan_parse_failed",
+        )
+        return replace(result, fix=fix), plan_state_after
+
+    scope_stop_reason = validate_post_fix_plan_scope(
+        before_fix_state,
+        after_fix_state,
+        result.selected_before,
+    )
+    if scope_stop_reason is not None:
+        fix = FixResult(
+            requested=True,
+            attempted=True,
+            returncode=fix_returncode,
+            result_md_path=result_md_path,
+            stop_reason=scope_stop_reason,
+        )
+        return replace(result, fix=fix), after_fix_state
+
+    selected_after = select_next_item(after_fix_state, include_parents=include_parents)
+    harness_checks = run_harness_checks()
+    write_json_file(
+        logs_dir / "fix_harness_checks.json",
+        [check.to_json_obj() for check in harness_checks],
+    )
+    checks_passed = all(check.returncode == 0 for check in harness_checks)
+    fix = FixResult(
+        requested=True,
+        attempted=True,
+        returncode=fix_returncode,
+        result_md_path=result_md_path,
+        harness_checks=harness_checks,
+        harness_checks_passed=checks_passed,
+        stop_reason=None if checks_passed else "fix_checks_failed",
+    )
+    return replace(result, fix=fix, selected_after=selected_after), after_fix_state
+
+
+def maybe_fix_and_rereview(
+    plan_files: PlanFiles,
+    result: ExecutionResult,
+    plan_state_after: PlanState,
+    include_parents: bool,
+    codex_bin: str,
+    fix_after_review: bool,
+) -> tuple[ExecutionResult, PlanState]:
+    review = result.review
+    if not fix_after_review:
+        return replace(result, fix=FixResult.not_requested()), plan_state_after
+    if review is None or not review.requested:
+        return replace(result, fix=FixResult.not_attempted()), plan_state_after
+    if review.verdict != "needs_fix" or review.stop_reason != "review_needs_fix":
+        return replace(result, fix=FixResult.not_attempted()), plan_state_after
+
+    result, plan_state_after = run_fix_after_review(
+        plan_files,
+        result,
+        plan_state_after,
+        include_parents=include_parents,
+        codex_bin=codex_bin,
+    )
+    if result.fix is not None and result.fix.failed():
+        return result, plan_state_after
+
+    result = run_review_after_pass(
+        plan_files,
+        result,
+        plan_state_after,
+        codex_bin=codex_bin,
+        after_fix=True,
+    )
+    return result, plan_state_after
 
 
 def execute_next(
@@ -1603,6 +2023,8 @@ def execute_next(
         prompt=prompt,
         same_selection_warning=same_selection_warning,
         review=ReviewResult.not_requested(),
+        fix=FixResult.not_requested(),
+        review_after_fix=ReviewResult.not_requested(),
     )
 
 
@@ -1727,6 +2149,22 @@ def print_review_result(review: ReviewResult | None) -> None:
         print(f"Stop reason: {review.stop_reason}")
 
 
+def print_fix_result(fix: FixResult | None) -> None:
+    fix = fix or FixResult.not_requested()
+    print("Fix:")
+    print(f"Requested: {fix.requested}")
+    if not fix.requested:
+        return
+    print(f"Attempted: {fix.attempted}")
+    if fix.returncode is not None:
+        print(f"Return code: {fix.returncode}")
+    if fix.result_md_path is not None:
+        print(f"Result: {fix.result_md_path}")
+    if fix.harness_checks_passed is not None:
+        print(f"Harness checks passed: {fix.harness_checks_passed}")
+    print(f"Stop reason: {fix.stop_reason}")
+
+
 def print_execution_output(
     plan_files: PlanFiles,
     plan_state_before: PlanState,
@@ -1756,6 +2194,12 @@ def print_execution_output(
     print()
     print_review_result(result.review)
     print()
+    print_fix_result(result.fix)
+    print()
+    if result.review_after_fix is not None and result.review_after_fix.requested:
+        print("Review after fix:")
+        print_review_result(result.review_after_fix)
+        print()
     print_commit_result(result.commit)
 
 
@@ -1816,6 +2260,12 @@ def build_execution_json_output(
     output["plan_backup_after"] = str(result.plan_backup_after)
     output["harness_checks"] = [check.to_json_obj() for check in result.harness_checks]
     output.update((result.review or ReviewResult.not_requested()).to_json_obj())
+    output.update((result.fix or FixResult.not_requested()).to_json_obj())
+    output.update(
+        (result.review_after_fix or ReviewResult.not_requested()).to_json_obj(
+            "review_after_fix"
+        )
+    )
     output.update((result.commit or CommitResult.not_requested()).to_json_obj())
     if result.same_selection_warning is not None:
         output["warning"] = result.same_selection_warning
@@ -1824,8 +2274,22 @@ def build_execution_json_output(
 
 def command_exit_code(result: ExecutionResult) -> int:
     if result.review is not None and result.review.failed():
-        if result.review.returncode not in (None, 0):
-            return result.review.returncode
+        recoverable_needs_fix = (
+            result.review.verdict == "needs_fix"
+            and result.fix is not None
+            and result.fix.requested
+        )
+        if not recoverable_needs_fix:
+            if result.review.returncode not in (None, 0):
+                return result.review.returncode
+            return 1
+    if result.fix is not None and result.fix.failed():
+        if result.fix.returncode not in (None, 0):
+            return result.fix.returncode
+        return 1
+    if result.review_after_fix is not None and result.review_after_fix.failed():
+        if result.review_after_fix.returncode not in (None, 0):
+            return result.review_after_fix.returncode
         return 1
     if commit_result_failed(result.commit):
         return result.commit.returncode or 1
@@ -1853,12 +2317,24 @@ def write_run_all_summary(run_dir: Path, records: list[RunAllRecord], stop_reaso
     for record in records:
         commit = record.commit or CommitResult.not_requested()
         review = record.review or ReviewResult.not_requested()
+        fix = record.fix or FixResult.not_requested()
+        review_after_fix = record.review_after_fix or ReviewResult.not_requested()
         line = f"- {record.selected_id}: {record.status}"
         if review.requested:
             if review.verdict:
                 line += f" review={review.verdict}"
             elif review.stop_reason:
                 line += f" review_stop={review.stop_reason}"
+        if fix.requested:
+            if fix.attempted and fix.stop_reason is None:
+                line += " fix=passed"
+            elif fix.stop_reason:
+                line += f" fix_stop={fix.stop_reason}"
+        if review_after_fix.requested:
+            if review_after_fix.verdict:
+                line += f" rereview={review_after_fix.verdict}"
+            elif review_after_fix.stop_reason:
+                line += f" rereview_stop={review_after_fix.stop_reason}"
         if commit.requested:
             if commit.created:
                 line += f" commit={commit.hash}"
@@ -1874,12 +2350,24 @@ def print_run_all_summary(records: list[RunAllRecord], stop_reason: str) -> None
     for record in records:
         commit = record.commit or CommitResult.not_requested()
         review = record.review or ReviewResult.not_requested()
+        fix = record.fix or FixResult.not_requested()
+        review_after_fix = record.review_after_fix or ReviewResult.not_requested()
         line = f"- {record.selected_id}: {record.status}"
         if review.requested:
             if review.verdict:
                 line += f" review={review.verdict}"
             elif review.stop_reason:
                 line += f" review_stop={review.stop_reason}"
+        if fix.requested:
+            if fix.attempted and fix.stop_reason is None:
+                line += " fix=passed"
+            elif fix.stop_reason:
+                line += f" fix_stop={fix.stop_reason}"
+        if review_after_fix.requested:
+            if review_after_fix.verdict:
+                line += f" rereview={review_after_fix.verdict}"
+            elif review_after_fix.stop_reason:
+                line += f" rereview_stop={review_after_fix.stop_reason}"
         if commit.requested:
             if commit.created:
                 line += f" commit={commit.hash}"
@@ -1949,6 +2437,7 @@ def run_all(
     codex_bin: str,
     verbose: bool,
     review_after_pass: bool,
+    fix_after_review: bool,
     commit_after_pass: bool,
     commit_prefix: str,
 ) -> int:
@@ -1996,6 +2485,7 @@ def run_all(
                 status="parse_failed",
                 logs_dir=str(logs_dir),
                 review=ReviewResult.not_attempted("parse failed") if review_after_pass else None,
+                fix=FixResult.not_attempted() if fix_after_review else None,
                 commit=commit_not_eligible("parse failed") if commit_after_pass else None,
             )
             records.append(record)
@@ -2018,10 +2508,14 @@ def run_all(
                 selection_before.item,
             ).status,
             review=ReviewResult.not_requested(),
+            fix=FixResult.not_requested(),
+            review_after_fix=ReviewResult.not_requested(),
             commit=CommitResult.not_requested(),
         )
         if review_after_pass:
             record.review = ReviewResult.not_attempted("pass not review-eligible")
+        if fix_after_review:
+            record.fix = FixResult.not_attempted()
         if commit_after_pass:
             record.commit = commit_not_eligible("pass not commit-eligible")
 
@@ -2078,13 +2572,75 @@ def run_all(
             )
             record.review = result.review
             if result.review is not None and result.review.failed():
+                if (
+                    fix_after_review
+                    and result.review.verdict == "needs_fix"
+                    and result.review.stop_reason == "review_needs_fix"
+                ):
+                    result, plan_state_after = maybe_fix_and_rereview(
+                        plan_files,
+                        result,
+                        plan_state_after,
+                        include_parents=include_parents,
+                        codex_bin=codex_bin,
+                        fix_after_review=fix_after_review,
+                    )
+                    record.fix = result.fix
+                    record.review_after_fix = result.review_after_fix
+                    if result.fix is not None and result.fix.failed():
+                        record.status = result.fix.stop_reason or "fix_failed"
+                        if commit_after_pass:
+                            record.commit = commit_not_eligible("fix did not pass")
+                        records.append(record)
+                        stop_reason = result.fix.stop_reason or "fix failed"
+                        write_run_all_summary(plan_files.run_dir, records, stop_reason)
+                        print_fix_result(result.fix)
+                        print_run_all_summary(records, stop_reason)
+                        return command_exit_code(result)
+                    if (
+                        result.review_after_fix is not None
+                        and result.review_after_fix.failed()
+                    ):
+                        record.status = (
+                            result.review_after_fix.stop_reason or "review_after_fix_failed"
+                        )
+                        if commit_after_pass:
+                            record.commit = commit_not_eligible("review did not pass")
+                        records.append(record)
+                        stop_reason = (
+                            result.review_after_fix.stop_reason or "review after fix failed"
+                        )
+                        write_run_all_summary(plan_files.run_dir, records, stop_reason)
+                        print_fix_result(result.fix)
+                        print_review_result(result.review_after_fix)
+                        print_run_all_summary(records, stop_reason)
+                        return command_exit_code(result)
+                else:
+                    record.status = result.review.stop_reason or "review_failed"
+                    if commit_after_pass:
+                        record.commit = commit_not_eligible("review did not pass")
+                    records.append(record)
+                    stop_reason = result.review.stop_reason or "review failed"
+                    write_run_all_summary(plan_files.run_dir, records, stop_reason)
+                    print_review_result(result.review)
+                    print_run_all_summary(records, stop_reason)
+                    return command_exit_code(result)
+
+            if fix_after_review and (record.fix is None or not record.fix.requested):
+                record.fix = result.fix or FixResult.not_attempted()
+
+            if (
+                result.review_after_fix is not None
+                and result.review_after_fix.requested
+                and result.review_after_fix.failed()
+            ):
                 record.status = result.review.stop_reason or "review_failed"
                 if commit_after_pass:
                     record.commit = commit_not_eligible("review did not pass")
                 records.append(record)
-                stop_reason = result.review.stop_reason or "review failed"
+                stop_reason = result.review_after_fix.stop_reason or "review after fix failed"
                 write_run_all_summary(plan_files.run_dir, records, stop_reason)
-                print_review_result(result.review)
+                print_review_result(result.review_after_fix)
                 print_run_all_summary(records, stop_reason)
                 return command_exit_code(result)
 
@@ -2114,6 +2670,9 @@ def run_all(
         print(f"Next selected: {next_text}")
         print("Harness checks: passed")
         print_review_result(result.review)
+        print_fix_result(result.fix)
+        if result.review_after_fix is not None and result.review_after_fix.requested:
+            print_review_result(result.review_after_fix)
         print_commit_result(result.commit)
 
         if result.selected_after.item is None:
@@ -2140,6 +2699,10 @@ def main() -> int:
             raise PlanError("--run-all cannot be used with --dry-run-prompt")
         if args.run_all and args.json:
             raise PlanError("--run-all --json is not implemented yet.")
+        if args.fix_after_review and not args.review_after_pass:
+            raise PlanError("--fix-after-review requires --review-after-pass")
+        if args.fix_after_review and args.max_fix_attempts != 1:
+            raise PlanError("V2.8 supports only --max-fix-attempts 1")
         if args.execute_next:
             print(
                 "--execute-next is deprecated; execution is now the default.",
@@ -2174,6 +2737,7 @@ def main() -> int:
                 codex_bin=args.codex_bin,
                 verbose=args.verbose,
                 review_after_pass=args.review_after_pass,
+                fix_after_review=args.fix_after_review,
                 commit_after_pass=args.commit_after_pass,
                 commit_prefix=args.commit_prefix,
             )
@@ -2234,6 +2798,14 @@ def main() -> int:
                     plan_state_after,
                     codex_bin=args.codex_bin,
                 )
+                result, plan_state_after = maybe_fix_and_rereview(
+                    plan_files,
+                    result,
+                    plan_state_after,
+                    include_parents=args.include_parents,
+                    codex_bin=args.codex_bin,
+                    fix_after_review=args.fix_after_review,
+                )
             else:
                 reason = "pass not review-eligible"
                 if result.codex_returncode != 0:
@@ -2241,6 +2813,10 @@ def main() -> int:
                 elif not harness_checks_passed(result):
                     reason = "harness failed"
                 result = replace(result, review=ReviewResult.not_attempted(reason))
+                if args.fix_after_review:
+                    result = replace(result, fix=FixResult.not_attempted())
+        elif args.fix_after_review:
+            result = replace(result, fix=FixResult.not_attempted())
         result = apply_commit_if_eligible(
             plan_files,
             result,
