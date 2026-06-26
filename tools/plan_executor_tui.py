@@ -189,10 +189,19 @@ class PlanExecutorTui(App[None]):
         content-align: left middle;
     }
 
-    .option-label {
+    .option-primary {
+        width: 28;
+        height: 1;
+    }
+
+    .option-secondary-label {
         width: 16;
         height: 1;
         content-align: left middle;
+    }
+
+    .option-secondary-control {
+        height: 1;
     }
 
     #options Input {
@@ -260,33 +269,73 @@ class PlanExecutorTui(App[None]):
         with Vertical(id="options"):
             with Horizontal(classes="option-row"):
                 yield Label("Run:", classes="option-group")
-                yield Checkbox("Run all", id="run-all", compact=True)
-                yield Label("Max passes:", classes="option-label")
-                yield Input(value="10", id="max-passes", classes="short-input", compact=True)
+                yield Checkbox("Run all", id="run-all", classes="option-primary", compact=True)
+                yield Label("Max passes:", classes="option-secondary-label")
+                yield Input(
+                    value="10",
+                    id="max-passes",
+                    classes="short-input option-secondary-control",
+                    compact=True,
+                )
             with Horizontal(classes="option-row"):
                 yield Label("Quality gates:", classes="option-group")
-                yield Checkbox("Review after pass", id="review-after-pass", compact=True)
-                yield Checkbox("Fix after review", id="fix-after-review", compact=True)
+                yield Checkbox(
+                    "Review after pass",
+                    id="review-after-pass",
+                    classes="option-primary",
+                    compact=True,
+                )
+                yield Checkbox(
+                    "Fix after review",
+                    id="fix-after-review",
+                    classes="option-secondary-control",
+                    compact=True,
+                )
             with Horizontal(classes="option-row"):
                 yield Label("Git:", classes="option-group")
-                yield Checkbox("Commit after pass", id="commit-after-pass", compact=True)
-                yield Label("Commit prefix:", classes="option-label")
-                yield Input(value="plan", id="commit-prefix", classes="short-input", compact=True)
+                yield Checkbox(
+                    "Commit after pass",
+                    id="commit-after-pass",
+                    classes="option-primary",
+                    compact=True,
+                )
+                yield Label("Commit prefix:", classes="option-secondary-label")
+                yield Input(
+                    value="plan",
+                    id="commit-prefix",
+                    classes="short-input option-secondary-control",
+                    compact=True,
+                )
             with Horizontal(classes="option-row"):
                 yield Label("Plan copy:", classes="option-group")
-                yield Checkbox("Copy to run dir", id="copy-to-run-dir", compact=True)
-                yield Label("Run dir:", classes="option-label")
+                yield Checkbox(
+                    "Copy to run dir",
+                    id="copy-to-run-dir",
+                    classes="option-primary",
+                    compact=True,
+                )
+                yield Label("Run dir:", classes="option-secondary-label")
                 yield Input(
                     placeholder=".agent-runs/example",
                     id="run-dir",
-                    classes="medium-input",
+                    classes="medium-input option-secondary-control",
                     compact=True,
                 )
             with Horizontal(classes="option-row"):
                 yield Label("Runtime:", classes="option-group")
-                yield Checkbox("Inhibit sleep", id="inhibit-sleep", compact=True)
-                yield Label("Codex bin:", classes="option-label")
-                yield Input(value="codex", id="codex-bin", classes="medium-input", compact=True)
+                yield Checkbox(
+                    "Inhibit sleep",
+                    id="inhibit-sleep",
+                    classes="option-primary",
+                    compact=True,
+                )
+                yield Label("Codex bin:", classes="option-secondary-label")
+                yield Input(
+                    value="codex",
+                    id="codex-bin",
+                    classes="medium-input option-secondary-control",
+                    compact=True,
+                )
             yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
             # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
             yield Static("", id="command-preview")
