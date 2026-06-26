@@ -40,6 +40,8 @@ MAX_RAW_OUTPUT_APPEND_PER_REFRESH = 200
 MAX_RAW_OUTPUT_PENDING_RESET_THRESHOLD = 1000
 MAX_RAW_OUTPUT_RENDER_LINE_CHARS = 1000
 RAW_OUTPUT_REFRESH_INTERVAL_SECONDS = 0.15
+GLOBAL_RUN_INDICATOR_INTERVAL_SECONDS = 0.2
+GLOBAL_RUN_INDICATOR_FRAMES = ("|", "/", "-", "\\")
 RAW_OUTPUT_TRUNCATION_TEXT = "[output truncated: oldest lines dropped]"
 TUI_RESULT_JSON_PATH = plan_executor.DEFAULT_RUNS_DIR / "tui-latest-run-result.json"
 RUN_ALL_REVIEW_UNAVAILABLE_MESSAGE = (
@@ -197,6 +199,26 @@ class ActiveRunSnapshot:
     codex_bin: str
     mode: Literal["one_pass", "run_all"] = "one_pass"
     max_passes: int | None = None
+
+
+def render_global_run_indicator(
+    active_run: ActiveRunSnapshot | None,
+    *,
+    run_in_progress: bool,
+    frame: str,
+    now: datetime,
+) -> str:
+    if not run_in_progress:
+        return "Idle"
+    if active_run is None:
+        return f"{frame} Running pass"
+
+    elapsed = format_elapsed_duration(active_run.started_at, now)
+    if active_run.mode == "run_all":
+        return f"{frame} Running all  {elapsed}"
+    if active_run.selected_id:
+        return f"{frame} Running pass {active_run.selected_id}  {elapsed}"
+    return f"{frame} Running pass  {elapsed}"
 
 
 @dataclass
@@ -951,6 +973,13 @@ class PlanExecutorTui(App[None]):
     #review-markdown {
         height: auto;
     }
+
+    #global-run-indicator {
+        height: 1;
+        padding: 0 1;
+        content-align: right middle;
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
@@ -984,6 +1013,8 @@ class PlanExecutorTui(App[None]):
         self.elapsed_refresh_timer: Any | None = None
         self.raw_output_refresh_timer: Any | None = None
         self.run_all_live_reload_timer: Any | None = None
+        self.global_run_indicator_timer: Any | None = None
+        self.global_run_indicator_frame_index = 0
         self.last_live_reload_selected_id: str | None = None
         self.last_live_reload_error: str | None = None
         self.run_all_review_unavailable = False
@@ -1112,6 +1143,7 @@ class PlanExecutorTui(App[None]):
             review_scroll.border_title = "Review"
             with review_scroll:
                 yield Static("", id="review-markdown")
+        yield Label("Idle", id="global-run-indicator")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1128,6 +1160,11 @@ class PlanExecutorTui(App[None]):
         self.run_all_live_reload_timer = self.set_interval(
             2.0, self.quiet_reload_for_run_all
         )
+        self.global_run_indicator_timer = self.set_interval(
+            GLOBAL_RUN_INDICATOR_INTERVAL_SECONDS,
+            self.refresh_global_run_indicator,
+        )
+        self.refresh_global_run_indicator()
         self.update_command_preview()
         self.update_control_state()
         if self.initial_plan_path:
@@ -1285,6 +1322,7 @@ class PlanExecutorTui(App[None]):
         )
         self.render_selection_panel()
         self.update_run_status("Running all" if mode == "run_all" else f"Running {selected_id}")
+        self.refresh_global_run_indicator()
         self.update_control_state()
         self.run_worker(
             self.run_selected_pass(
@@ -1439,6 +1477,25 @@ class PlanExecutorTui(App[None]):
     def refresh_running_selection(self) -> None:
         if self.run_in_progress:
             self.render_selection_panel()
+
+    def refresh_global_run_indicator(self) -> None:
+        try:
+            label = self.query_one("#global-run-indicator", Label)
+        except Exception:
+            return
+        frame = GLOBAL_RUN_INDICATOR_FRAMES[self.global_run_indicator_frame_index]
+        label.update(
+            render_global_run_indicator(
+                self.active_run,
+                run_in_progress=self.run_in_progress,
+                frame=frame,
+                now=datetime.now(),
+            )
+        )
+        if self.run_in_progress:
+            self.global_run_indicator_frame_index = (
+                self.global_run_indicator_frame_index + 1
+            ) % len(GLOBAL_RUN_INDICATOR_FRAMES)
 
     def update_command_preview(self) -> None:
         options = self.current_options()
@@ -1665,6 +1722,7 @@ class PlanExecutorTui(App[None]):
                 max_passes=options.max_passes if mode == "run_all" else None,
             )
             self.render_selection_panel()
+            self.refresh_global_run_indicator()
         self.append_log(
             f"Starting run-all with max passes {options.max_passes}."
             if mode == "run_all"
@@ -1750,6 +1808,7 @@ class PlanExecutorTui(App[None]):
             self.current_run_mode = None
             self.current_result_json_path = None
             self.active_run = None
+            self.refresh_global_run_indicator()
             self.refresh_review_view(auto_scroll=False)
             try:
                 if self.load_plan(plan_path, log_load=False, preserve_last_run=True):

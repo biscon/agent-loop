@@ -39,6 +39,7 @@ def import_tui_or_skip():
             build_selection_panel_text,
             format_elapsed_duration,
             load_review_markdown,
+            render_global_run_indicator,
             render_raw_output_state,
             render_recent_log_lines,
             select_latest_review_artifact,
@@ -64,6 +65,7 @@ def import_tui_or_skip():
         build_selection_panel_text,
         format_elapsed_duration,
         load_review_markdown,
+        render_global_run_indicator,
         render_raw_output_state,
         Button,
         Checkbox,
@@ -163,6 +165,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.build_selection_panel_text,
             self.format_elapsed_duration,
             self.load_review_markdown,
+            self.render_global_run_indicator,
             self.render_raw_output_state,
             self.Button,
             self.Checkbox,
@@ -204,6 +207,9 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         return self.panel_text(app, "#review-details") + "\n" + self.panel_text(
             app, "#review-markdown"
         )
+
+    def global_indicator_text(self, app) -> str:
+        return str(app.query_one("#global-run-indicator").content)
 
     async def set_plan_path(self, app, pilot, plan_path: str) -> None:
         app.query_one("#plan-path", self.Input).value = plan_path
@@ -376,6 +382,75 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Options:\n  review, fix, commit", text)
         self.assertIn("Current selection:", text)
         self.assertIn("phase_04 - Next title", text)
+
+    def test_global_run_indicator_helper_renders_idle_state(self) -> None:
+        text = self.render_global_run_indicator(
+            None,
+            run_in_progress=False,
+            frame="|",
+            now=datetime_from_text("2026-06-26 12:00:00"),
+        )
+
+        self.assertEqual(text, "Idle")
+
+    def test_global_run_indicator_helper_renders_one_pass_running_state(self) -> None:
+        started = datetime_from_text("2026-06-26 12:00:00")
+        active = self.ActiveRunSnapshot(
+            selected_id="phase_02",
+            selected_title="Some title",
+            started_at=started,
+            options_summary="none",
+            codex_bin="codex",
+        )
+
+        text = self.render_global_run_indicator(
+            active,
+            run_in_progress=True,
+            frame="|",
+            now=datetime_from_text("2026-06-26 12:00:37"),
+        )
+
+        self.assertEqual(text, "| Running pass phase_02  00:37")
+
+    def test_global_run_indicator_helper_handles_missing_selected_id(self) -> None:
+        started = datetime_from_text("2026-06-26 12:00:00")
+        active = self.ActiveRunSnapshot(
+            selected_id="",
+            selected_title="Some title",
+            started_at=started,
+            options_summary="none",
+            codex_bin="codex",
+        )
+
+        text = self.render_global_run_indicator(
+            active,
+            run_in_progress=True,
+            frame="/",
+            now=datetime_from_text("2026-06-26 12:00:37"),
+        )
+
+        self.assertEqual(text, "/ Running pass  00:37")
+
+    def test_global_run_indicator_helper_renders_run_all_running_state(self) -> None:
+        started = datetime_from_text("2026-06-26 12:00:00")
+        active = self.ActiveRunSnapshot(
+            selected_id="phase_02",
+            selected_title="Some title",
+            started_at=started,
+            options_summary="none",
+            codex_bin="codex",
+            mode="run_all",
+            max_passes=3,
+        )
+
+        text = self.render_global_run_indicator(
+            active,
+            run_in_progress=True,
+            frame="-",
+            now=datetime_from_text("2026-06-26 12:03:12"),
+        )
+
+        self.assertEqual(text, "- Running all  03:12")
 
     def test_selection_panel_helper_renders_finished_state(self) -> None:
         current = plan_executor.PlanItem(
@@ -913,6 +988,86 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertIn("Cannot run: no valid plan loaded.", self.log_text(app))
+
+    async def test_tui_global_run_indicator_initial_state_is_idle(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test():
+            indicator = app.query_one("#global-run-indicator")
+
+            self.assertEqual(self.global_indicator_text(app), "Idle")
+            self.assertTrue(indicator.display)
+            self.assertEqual(indicator.styles.height.value, 1)
+
+    async def test_tui_global_run_indicator_ticks_running_only(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test():
+            app.global_run_indicator_frame_index = 0
+            app.refresh_global_run_indicator()
+            self.assertEqual(self.global_indicator_text(app), "Idle")
+            self.assertEqual(app.global_run_indicator_frame_index, 0)
+
+            app.run_in_progress = True
+            app.active_run = self.ActiveRunSnapshot(
+                selected_id="phase_02",
+                selected_title="Some title",
+                started_at=datetime.now(),
+                options_summary="none",
+                codex_bin="codex",
+            )
+            app.refresh_global_run_indicator()
+            first_text = self.global_indicator_text(app)
+            app.refresh_global_run_indicator()
+            second_text = self.global_indicator_text(app)
+
+            self.assertTrue(first_text.startswith("| Running pass phase_02"))
+            self.assertTrue(second_text.startswith("/ Running pass phase_02"))
+            self.assertEqual(app.global_run_indicator_frame_index, 2)
+
+    async def test_tui_global_run_indicator_tick_updates_only_indicator(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test():
+            calls: list[str] = []
+            app.run_in_progress = True
+            app.active_run = self.ActiveRunSnapshot(
+                selected_id="phase_02",
+                selected_title="Some title",
+                started_at=datetime.now(),
+                options_summary="none",
+                codex_bin="codex",
+            )
+
+            def unexpected_call(*args, **kwargs) -> None:
+                calls.append("unexpected")
+
+            app.render_selection_panel = unexpected_call
+            app.refresh_raw_output_view = unexpected_call
+            app.refresh_review_view = unexpected_call
+            app.append_log = unexpected_call
+
+            app.refresh_global_run_indicator()
+
+            self.assertEqual(calls, [])
+            self.assertIn("Running pass phase_02", self.global_indicator_text(app))
+
+    async def test_tui_global_run_indicator_visible_across_views(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            app.active_run = self.ActiveRunSnapshot(
+                selected_id="phase_02",
+                selected_title="Some title",
+                started_at=datetime.now(),
+                options_summary="none",
+                codex_bin="codex",
+            )
+            app.refresh_global_run_indicator()
+
+            for key in ("f3", "f4", "f2"):
+                await pilot.press(key)
+                await pilot.pause()
+                indicator = app.query_one("#global-run-indicator")
+                self.assertTrue(indicator.display)
+                self.assertIn("Running pass phase_02", self.global_indicator_text(app))
 
     async def test_tui_run_all_starts_fake_subprocess_and_restores_controls(self) -> None:
         captured_args = []
@@ -1623,7 +1778,9 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
                 await self.click_load(pilot)
                 timer = app.elapsed_refresh_timer
+                indicator_timer = app.global_run_indicator_timer
                 self.assertIsNotNone(timer)
+                self.assertIsNotNone(indicator_timer)
 
                 for _ in range(2):
                     app.action_run_pass()
@@ -1632,6 +1789,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                         if not app.run_in_progress and app.active_run is None:
                             break
                     self.assertIs(app.elapsed_refresh_timer, timer)
+                    self.assertIs(app.global_run_indicator_timer, indicator_timer)
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
