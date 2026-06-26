@@ -16,7 +16,7 @@ import threading
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 DONE_STATUSES = {"Completed", "Deferred"}
@@ -691,6 +691,7 @@ def build_tui_subprocess_argv(
     plan_path: str,
     options: TuiOptions,
     *,
+    mode: Literal["one_pass", "run_all"] = "one_pass",
     python_executable: str = sys.executable,
     runner_path: Path | None = None,
     result_json_path: Path | str | None = None,
@@ -699,8 +700,13 @@ def build_tui_subprocess_argv(
     argv = [python_executable, str(runner)]
     if plan_path:
         argv.append(plan_path)
-    argv.extend(build_tui_option_argv(options, include_run_all=False))
-    if result_json_path is not None:
+    if mode == "one_pass":
+        argv.extend(build_tui_option_argv(replace(options, run_all=False)))
+    elif mode == "run_all":
+        argv.extend(build_tui_option_argv(replace(options, run_all=True)))
+    else:
+        raise PlanError(f"unknown TUI subprocess mode: {mode}")
+    if mode == "one_pass" and result_json_path is not None:
         argv.extend(["--result-json", str(result_json_path)])
     return argv
 

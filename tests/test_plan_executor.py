@@ -336,6 +336,47 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Options:\n  review, fix, commit", text)
         self.assertIn("Codex:\n  /tmp/fake-codex", text)
 
+    def test_selection_panel_helper_renders_run_all_running_state(self) -> None:
+        started = datetime_from_text("2026-06-26 12:00:00")
+        current = plan_executor.PlanItem(
+            id="phase_04",
+            title="Next title",
+            type="phase",
+            status="Not Started",
+        )
+        view = plan_executor.PlanStatusView(
+            plan_file=Path("docs/test.md"),
+            plan_id="test_plan",
+            selected=current,
+            selected_parent=None,
+            items=[current],
+            suggested_prompt="Read docs/test.md and execute phase_04 only.",
+        )
+        active = self.ActiveRunSnapshot(
+            selected_id="phase_03",
+            selected_title="Some title",
+            started_at=started,
+            options_summary="review, fix, commit",
+            codex_bin="/tmp/fake-codex",
+            mode="run_all",
+            max_passes=7,
+        )
+
+        text = self.build_selection_panel_text(
+            view,
+            active,
+            None,
+            None,
+            datetime_from_text("2026-06-26 12:03:41"),
+        )
+
+        self.assertIn("Running all:", text)
+        self.assertIn("Elapsed:\n  03:41", text)
+        self.assertIn("Max passes:\n  7", text)
+        self.assertIn("Options:\n  review, fix, commit", text)
+        self.assertIn("Current selection:", text)
+        self.assertIn("phase_04 - Next title", text)
+
     def test_selection_panel_helper_renders_finished_state(self) -> None:
         current = plan_executor.PlanItem(
             id="phase_04",
@@ -371,6 +412,42 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Failed with return code 42", text)
         self.assertIn("Current selection:", text)
         self.assertIn("phase_04 - Next title", text)
+
+    def test_selection_panel_helper_renders_run_all_finished_state(self) -> None:
+        current = plan_executor.PlanItem(
+            id="phase_05",
+            title="Next title",
+            type="phase",
+            status="Planned",
+        )
+        view = plan_executor.PlanStatusView(
+            plan_file=Path("docs/test.md"),
+            plan_id="test_plan",
+            selected=current,
+            selected_parent=None,
+            items=[current],
+            suggested_prompt="Read docs/test.md and execute phase_05 only.",
+        )
+        result = self.LastRunResult(
+            selected_id="run-all",
+            selected_title="",
+            finished_at=datetime_from_text("2026-06-26 12:01:00"),
+            return_code=0,
+            mode="run_all",
+        )
+
+        text = self.build_selection_panel_text(
+            view,
+            None,
+            result,
+            None,
+            datetime_from_text("2026-06-26 12:01:00"),
+        )
+
+        self.assertIn("Last run:\n  run-all", text)
+        self.assertIn("Finished with return code 0", text)
+        self.assertIn("Current selection:", text)
+        self.assertIn("phase_05 - Next title", text)
 
     def test_selection_panel_helper_renders_internal_failure_without_return_code(self) -> None:
         result = self.LastRunResult(
@@ -807,6 +884,28 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(self.run_pass_button_disabled(app))
 
+    async def test_tui_run_button_label_reflects_run_all_checkbox(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+
+            button = app.query_one("#run-pass-button", self.Button)
+            self.assertEqual(str(button.label), "Run Pass")
+
+            app.query_one("#run-all", self.Checkbox).value = True
+            await pilot.pause()
+
+            self.assertEqual(str(button.label), "Run All")
+
+    async def test_tui_invalid_max_passes_still_falls_back_to_ten(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.query_one("#max-passes", self.Input).value = "not-an-int"
+            await pilot.pause()
+
+            self.assertEqual(app.current_options().max_passes, 10)
+
     async def test_tui_run_key_without_valid_plan_logs_clear_message(self) -> None:
         app = self.PlanExecutorTui()
         async with app.run_test() as pilot:
@@ -815,22 +914,258 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("Cannot run: no valid plan loaded.", self.log_text(app))
 
-    async def test_tui_run_pass_rejects_run_all_option(self) -> None:
+    async def test_tui_run_all_starts_fake_subprocess_and_restores_controls(self) -> None:
+        captured_args = []
+        release_process = asyncio.Event()
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured_args.extend(args)
+            process = self.FakeProcess(0, self.fake_stream("fake run-all stdout\n"), self.fake_stream("fake run-all stderr\n"))
+
+            async def wait() -> int:
+                await release_process.wait()
+                return 0
+
+            process.wait = wait
+            return process
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
         app = self.PlanExecutorTui()
-        async with app.run_test() as pilot:
-            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
-            await self.click_load(pilot)
-            app.query_one("#run-all", self.Checkbox).value = True
-            await pilot.pause()
+        try:
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+                app.query_one("#run-all", self.Checkbox).value = True
+                await pilot.pause()
 
-            app.action_run_pass()
-            await pilot.pause()
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if app.run_in_progress:
+                        break
 
-            self.assertFalse(app.run_in_progress)
-            self.assertIn(
-                "Run all is not implemented in the TUI yet. Uncheck Run all to run one pass.",
-                self.log_text(app),
-            )
+                self.assertTrue(app.run_in_progress)
+                self.assertTrue(self.run_pass_button_disabled(app))
+                self.assertIn("--run-all", captured_args)
+                self.assertIn("--max-passes", captured_args)
+                self.assertNotIn("--result-json", captured_args)
+                self.assertIsNone(app.latest_run_metadata)
+                raw_state_text = self.render_raw_output_state(app.raw_output_state)
+                self.assertIn("Run:\n  run-all", raw_state_text)
+                self.assertIn("Status:\n  Running all", raw_state_text)
+                self.assertIn("Command:", raw_state_text)
+
+                release_process.set()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress and app.active_run is None:
+                        break
+
+                self.assertFalse(app.run_in_progress)
+                self.assertFalse(self.run_pass_button_disabled(app))
+                self.assertIn("Finished with return code 0", app.raw_output_state.status)
+                self.capture_raw_output_widget_writes(app)
+                await pilot.press("f3")
+                await pilot.pause()
+                self.assertIn("fake run-all stdout", self.raw_output_text(app))
+                self.assertIn("fake run-all stderr", self.raw_output_text(app))
+                self.assertNotIn("fake run-all stdout", self.log_text(app))
+        finally:
+            release_process.set()
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_run_all_complete_plan_disables_button_and_keyboard_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "complete.md"
+            completed_items = phase_items(2)
+            for item in completed_items:
+                item["status"] = "Completed"
+            write_plan(plan_file, base_state(completed_items))
+
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, str(plan_file))
+                await self.click_load(pilot)
+                app.query_one("#run-all", self.Checkbox).value = True
+                await pilot.pause()
+
+                self.assertTrue(self.run_pass_button_disabled(app))
+
+                app.action_run_pass()
+                await pilot.pause()
+
+                self.assertFalse(app.run_in_progress)
+                self.assertIn(
+                    "Cannot run all: plan is already complete.",
+                    self.log_text(app),
+                )
+
+    async def test_tui_run_all_copy_mode_guard_does_not_start_subprocess(self) -> None:
+        subprocess_called = False
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            nonlocal subprocess_called
+            subprocess_called = True
+            return self.FakeProcess(0, self.fake_stream(), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+                app.query_one("#run-all", self.Checkbox).value = True
+                app.query_one("#copy-to-run-dir", self.Checkbox).value = True
+                await pilot.pause()
+
+                app.action_run_pass()
+                await pilot.pause()
+
+                self.assertFalse(subprocess_called)
+                self.assertFalse(app.run_in_progress)
+                self.assertIn(
+                    self.plan_executor_tui.RUN_ALL_COPY_GUARD_MESSAGE,
+                    self.log_text(app),
+                )
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_run_all_quiet_reload_preserves_running_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "plan.md"
+            write_plan(plan_file, two_phase_state())
+
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, str(plan_file))
+                await self.click_load(pilot)
+                started_at = datetime_from_text("2026-06-26 12:00:00")
+                app.run_in_progress = True
+                app.current_run_mode = "run_all"
+                app.active_run = self.ActiveRunSnapshot(
+                    selected_id="phase_01",
+                    selected_title="Phase 1",
+                    started_at=started_at,
+                    options_summary="review",
+                    codex_bin="codex",
+                    mode="run_all",
+                    max_passes=10,
+                )
+                app.last_live_reload_selected_id = "phase_01"
+
+                write_plan(plan_file, two_phase_state(phase_01_status="Completed"))
+                app.quiet_reload_for_run_all()
+
+                self.assertTrue(app.run_in_progress)
+                self.assertEqual(app.current_run_mode, "run_all")
+                self.assertIsNotNone(app.active_run)
+                self.assertEqual(app.active_run.started_at, started_at)
+                self.assertIsNone(app.last_run_result)
+                self.assertIn("phase_01 Completed", self.panel_text(app, "#progress"))
+                selection_text = self.panel_text(app, "#selection")
+                self.assertIn("Running all:", selection_text)
+                self.assertIn("phase_02 - Phase 2", selection_text)
+                self.assertIn(
+                    "Selected item changed: phase_01 -> phase_02.",
+                    self.log_text(app),
+                )
+
+    async def test_tui_run_all_quiet_reload_failure_dedupes_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "plan.md"
+            write_plan(plan_file, two_phase_state())
+
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, str(plan_file))
+                await self.click_load(pilot)
+                app.run_in_progress = True
+                app.current_run_mode = "run_all"
+                app.active_run = self.ActiveRunSnapshot(
+                    selected_id="phase_01",
+                    selected_title="Phase 1",
+                    started_at=datetime_from_text("2026-06-26 12:00:00"),
+                    options_summary="none",
+                    codex_bin="codex",
+                    mode="run_all",
+                    max_passes=10,
+                )
+                app.last_live_reload_selected_id = "phase_01"
+
+                plan_file.write_text("# Invalid\n", encoding="utf-8")
+                app.quiet_reload_for_run_all()
+                app.quiet_reload_for_run_all()
+
+                log_text = "\n".join(app.log_lines)
+                self.assertEqual(log_text.count("Live reload failed:"), 1)
+                self.assertIn("Load failed:", self.panel_text(app, "#selection"))
+
+                write_plan(plan_file, two_phase_state())
+                app.quiet_reload_for_run_all()
+
+                self.assertIn("Live reload recovered.", "\n".join(app.log_lines))
+                self.assertNotIn("Load failed:", self.panel_text(app, "#selection"))
+
+    async def test_tui_run_all_review_view_clears_stale_single_pass_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            review_md = Path(tmp) / "review.md"
+            review_md.write_text("# Old review\n\nOld body\n", encoding="utf-8")
+            release_process = asyncio.Event()
+
+            async def fake_create_subprocess_exec(*args, **kwargs):
+                process = self.FakeProcess(0, self.fake_stream(), self.fake_stream())
+
+                async def wait() -> int:
+                    await release_process.wait()
+                    return 0
+
+                process.wait = wait
+                return process
+
+            original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+            self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+            try:
+                app = self.PlanExecutorTui()
+                async with app.run_test() as pilot:
+                    await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                    await self.click_load(pilot)
+                    app.latest_run_metadata = self.LatestRunMetadata(
+                        result_json_path="old.json",
+                        selected_before_id="phase_00",
+                        selected_before_title="Old",
+                        review_requested=True,
+                        review_result_md=str(review_md),
+                    )
+                    app.query_one("#run-all", self.Checkbox).value = True
+                    await pilot.pause()
+
+                    app.action_run_pass()
+                    await pilot.press("f4")
+                    await pilot.pause()
+
+                    self.assertIn(
+                        self.plan_executor_tui.RUN_ALL_REVIEW_UNAVAILABLE_MESSAGE,
+                        self.review_text(app),
+                    )
+                    self.assertNotIn("Old body", self.review_text(app))
+
+                    release_process.set()
+                    for _ in range(10):
+                        await pilot.pause(0.05)
+                        if not app.run_in_progress and app.active_run is None:
+                            break
+
+                    await pilot.press("f4")
+                    await pilot.pause()
+                    self.assertIn(
+                        self.plan_executor_tui.RUN_ALL_REVIEW_UNAVAILABLE_MESSAGE,
+                        self.review_text(app),
+                    )
+                    self.assertNotIn("Old body", self.review_text(app))
+            finally:
+                self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
     async def test_tui_subprocess_creation_failure_restores_controls(self) -> None:
         async def fail_create_subprocess_exec(*args, **kwargs):
@@ -1996,6 +2331,7 @@ class PlanExecutorTests(unittest.TestCase):
         argv = plan_executor.build_tui_subprocess_argv(
             "docs/my_plan.md",
             plan_executor.TuiOptions(),
+            mode="one_pass",
             python_executable="/usr/bin/python",
             runner_path=Path("/repo/tools/plan_executor.py"),
             result_json_path=Path(".agent-runs/tui-latest-run-result.json"),
@@ -2020,17 +2356,57 @@ class PlanExecutorTests(unittest.TestCase):
 
         self.assertNotIn("--result-json", preview)
 
-    def test_tui_subprocess_argv_rejects_run_all(self) -> None:
-        with self.assertRaisesRegex(
-            plan_executor.PlanError,
-            "Run all is not implemented in the TUI yet",
-        ):
-            plan_executor.build_tui_subprocess_argv(
+    def test_tui_subprocess_argv_mode_is_authoritative_for_one_pass(self) -> None:
+        argv = plan_executor.build_tui_subprocess_argv(
+            "docs/my_plan.md",
+            plan_executor.TuiOptions(run_all=True),
+            mode="one_pass",
+            python_executable="/usr/bin/python",
+            runner_path=Path("/repo/tools/plan_executor.py"),
+            result_json_path=Path(".agent-runs/result.json"),
+        )
+
+        self.assertNotIn("--run-all", argv)
+        self.assertIn("--result-json", argv)
+
+    def test_tui_subprocess_argv_for_run_all_options(self) -> None:
+        argv = plan_executor.build_tui_subprocess_argv(
+            "docs/my_plan.md",
+            plan_executor.TuiOptions(
+                max_passes=3,
+                review_after_pass=True,
+                fix_after_review=True,
+                commit_after_pass=True,
+                commit_prefix="work",
+                inhibit_sleep=True,
+                codex_bin="fake-codex",
+            ),
+            mode="run_all",
+            python_executable="/usr/bin/python",
+            runner_path=Path("/repo/tools/plan_executor.py"),
+            result_json_path=Path(".agent-runs/ignored.json"),
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                "/usr/bin/python",
+                "/repo/tools/plan_executor.py",
                 "docs/my_plan.md",
-                plan_executor.TuiOptions(run_all=True),
-                python_executable="/usr/bin/python",
-                runner_path=Path("/repo/tools/plan_executor.py"),
-            )
+                "--run-all",
+                "--max-passes",
+                "3",
+                "--review-after-pass",
+                "--fix-after-review",
+                "--commit-after-pass",
+                "--commit-prefix",
+                "work",
+                "--inhibit-sleep",
+                "--codex-bin",
+                "fake-codex",
+            ],
+        )
+        self.assertNotIn("--result-json", argv)
 
     def test_result_json_appears_in_parsed_args(self) -> None:
         args = plan_executor.parse_args(

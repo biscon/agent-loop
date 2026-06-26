@@ -8,7 +8,7 @@ import shlex
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -42,6 +42,14 @@ MAX_RAW_OUTPUT_RENDER_LINE_CHARS = 1000
 RAW_OUTPUT_REFRESH_INTERVAL_SECONDS = 0.15
 RAW_OUTPUT_TRUNCATION_TEXT = "[output truncated: oldest lines dropped]"
 TUI_RESULT_JSON_PATH = plan_executor.DEFAULT_RUNS_DIR / "tui-latest-run-result.json"
+RUN_ALL_REVIEW_UNAVAILABLE_MESSAGE = (
+    "Review artifacts for run-all are not available in this view yet.\n"
+    "Use F3 Output or inspect the run logs manually."
+)
+RUN_ALL_COPY_GUARD_MESSAGE = (
+    "Run all with Copy to run dir is not supported in the TUI yet. "
+    "Load a copied plan directly to use live run-all progress."
+)
 
 
 class PlanBrowseDialog(ModalScreen[Path | None]):
@@ -187,6 +195,8 @@ class ActiveRunSnapshot:
     started_at: datetime
     options_summary: str
     codex_bin: str
+    mode: Literal["one_pass", "run_all"] = "one_pass"
+    max_passes: int | None = None
 
 
 @dataclass
@@ -197,6 +207,7 @@ class LastRunResult:
     return_code: int | None = None
     failure_message: str | None = None
     reload_error: str | None = None
+    mode: Literal["one_pass", "run_all"] = "one_pass"
 
 
 @dataclass
@@ -658,6 +669,27 @@ def build_selection_panel_text(
 ) -> str:
     lines = ["Current Selection", ""]
     if active_run is not None:
+        if active_run.mode == "run_all":
+            lines.extend(
+                [
+                    "Running all:",
+                    "",
+                    "Started:",
+                    f"  {active_run.started_at.strftime('%H:%M:%S')}",
+                    "",
+                    "Elapsed:",
+                    f"  {format_elapsed_duration(active_run.started_at, now)}",
+                    "",
+                    "Max passes:",
+                    f"  {active_run.max_passes if active_run.max_passes is not None else 'Not available'}",
+                    "",
+                    "Options:",
+                    f"  {active_run.options_summary}",
+                    "",
+                ]
+            )
+            append_current_selection_lines(lines, loaded_view, load_error)
+            return "\n".join(lines)
         lines.extend(
             [
                 "Running:",
@@ -682,10 +714,15 @@ def build_selection_panel_text(
         return "\n".join(lines)
 
     if last_run is not None:
+        last_run_text = (
+            "run-all"
+            if last_run.mode == "run_all"
+            else f"{last_run.selected_id} - {last_run.selected_title}"
+        )
         lines.extend(
             [
                 "Last run:",
-                f"  {last_run.selected_id} - {last_run.selected_title}",
+                f"  {last_run_text}",
                 "",
                 "Result:",
                 f"  {format_run_result(last_run)}",
@@ -938,6 +975,7 @@ class PlanExecutorTui(App[None]):
         self.safe_quit_dialog_open = False
         self.current_run_selected_id: str | None = None
         self.current_run_started_at: datetime | None = None
+        self.current_run_mode: Literal["one_pass", "run_all"] | None = None
         self.active_run: ActiveRunSnapshot | None = None
         self.last_run_result: LastRunResult | None = None
         self.latest_run_metadata: LatestRunMetadata | None = None
@@ -945,6 +983,10 @@ class PlanExecutorTui(App[None]):
         self.current_load_error: str | None = None
         self.elapsed_refresh_timer: Any | None = None
         self.raw_output_refresh_timer: Any | None = None
+        self.run_all_live_reload_timer: Any | None = None
+        self.last_live_reload_selected_id: str | None = None
+        self.last_live_reload_error: str | None = None
+        self.run_all_review_unavailable = False
         self.raw_output_state = RawOutputState()
         self.raw_output_dirty = False
         self.raw_output_display_initialized = False
@@ -1083,6 +1125,9 @@ class PlanExecutorTui(App[None]):
         self.raw_output_refresh_timer = self.set_interval(
             RAW_OUTPUT_REFRESH_INTERVAL_SECONDS, self.refresh_dirty_raw_output_view
         )
+        self.run_all_live_reload_timer = self.set_interval(
+            2.0, self.quiet_reload_for_run_all
+        )
         self.update_command_preview()
         self.update_control_state()
         if self.initial_plan_path:
@@ -1134,6 +1179,7 @@ class PlanExecutorTui(App[None]):
     @on(Checkbox.Changed)
     def checkbox_changed(self) -> None:
         self.update_command_preview()
+        self.update_control_state()
 
     def action_blur_input(self) -> None:
         focused = self.focused
@@ -1195,15 +1241,20 @@ class PlanExecutorTui(App[None]):
         if self.run_in_progress:
             self.append_log("Run already in progress.")
             return
-        if self.loaded_view is None or self.loaded_view.selected is None:
+        if self.loaded_view is None:
             self.append_log("Cannot run: no valid plan loaded.")
             return
         options = self.current_options()
+        mode: Literal["one_pass", "run_all"] = "run_all" if options.run_all else "one_pass"
         if options.run_all:
-            self.append_log(
-                "Run all is not implemented in the TUI yet. "
-                "Uncheck Run all to run one pass."
-            )
+            if self.loaded_view.selected is None:
+                self.append_log("Cannot run all: plan is already complete.")
+                return
+            if options.copy_to_run_dir:
+                self.append_log(RUN_ALL_COPY_GUARD_MESSAGE)
+                return
+        elif self.loaded_view.selected is None:
+            self.append_log("Cannot run: no valid plan loaded.")
             return
 
         selected_id = self.loaded_view.selected.id
@@ -1213,10 +1264,14 @@ class PlanExecutorTui(App[None]):
         self.quit_after_run = False
         self.last_run_result = None
         self.latest_run_metadata = None
+        self.run_all_review_unavailable = mode == "run_all"
         self.refresh_review_view(auto_scroll=False)
         self.current_load_error = None
         self.current_run_selected_id = selected_id
-        self.current_result_json_path = TUI_RESULT_JSON_PATH
+        self.current_run_mode = mode
+        self.current_result_json_path = TUI_RESULT_JSON_PATH if mode == "one_pass" else None
+        self.last_live_reload_selected_id = selected_id if mode == "run_all" else None
+        self.last_live_reload_error = None
         started_at = datetime.now()
         self.current_run_started_at = started_at
         self.active_run = ActiveRunSnapshot(
@@ -1225,9 +1280,11 @@ class PlanExecutorTui(App[None]):
             started_at=started_at,
             options_summary=summarize_tui_options(options),
             codex_bin=options.codex_bin,
+            mode=mode,
+            max_passes=options.max_passes if mode == "run_all" else None,
         )
         self.render_selection_panel()
-        self.update_run_status(f"Running {selected_id}")
+        self.update_run_status("Running all" if mode == "run_all" else f"Running {selected_id}")
         self.update_control_state()
         self.run_worker(
             self.run_selected_pass(
@@ -1235,6 +1292,7 @@ class PlanExecutorTui(App[None]):
                 selected_id,
                 options,
                 self.current_result_json_path,
+                mode=mode,
             ),
             name="run-pass",
             exclusive=True,
@@ -1268,6 +1326,7 @@ class PlanExecutorTui(App[None]):
     ) -> bool:
         if not preserve_last_run:
             self.last_run_result = None
+            self.run_all_review_unavailable = False
         if plan_path is None:
             plan_path = self.plan_path_text
         plan_text = plan_path.strip()
@@ -1315,6 +1374,37 @@ class PlanExecutorTui(App[None]):
         if not self.quit_after_run:
             self.update_control_state()
         return True
+
+    def quiet_reload_for_run_all(self) -> None:
+        if not self.run_in_progress or self.current_run_mode != "run_all":
+            return
+        state = plan_executor.load_tui_plan_state(self.plan_path_text)
+        if state.view is None:
+            error = state.load_error or "unknown error"
+            self.current_load_error = error
+            if self.last_live_reload_error != error:
+                self.append_log(f"Live reload failed: {error}")
+                self.last_live_reload_error = error
+            self.render_selection_panel()
+            return
+
+        view = state.view
+        selected_id = view.selected.id if view.selected is not None else None
+        if self.last_live_reload_error is not None:
+            self.append_log("Live reload recovered.")
+            self.last_live_reload_error = None
+        if (
+            self.last_live_reload_selected_id is not None
+            and selected_id != self.last_live_reload_selected_id
+        ):
+            self.append_log(
+                f"Selected item changed: {self.last_live_reload_selected_id} -> {selected_id}."
+            )
+        self.last_live_reload_selected_id = selected_id
+        self.loaded_view = view
+        self.current_load_error = None
+        self.render_progress(view)
+        self.render_selection_panel()
 
     def render_progress(self, view: plan_executor.PlanStatusView) -> None:
         lines = []
@@ -1475,7 +1565,12 @@ class PlanExecutorTui(App[None]):
             self.raw_output_dirty = not self.raw_output_display_is_synchronized()
 
     def refresh_review_view(self, *, auto_scroll: bool = False) -> None:
-        if self.run_in_progress:
+        if self.run_all_review_unavailable:
+            self.query_one("#review-details", Static).update("Review")
+            self.query_one("#review-markdown", Static).update(
+                RUN_ALL_REVIEW_UNAVAILABLE_MESSAGE
+            )
+        elif self.run_in_progress:
             self.query_one("#review-details", Static).update("Review")
             self.query_one("#review-markdown", Static).update(
                 "Run in progress. Review output will be available after completion if review is enabled."
@@ -1505,6 +1600,9 @@ class PlanExecutorTui(App[None]):
         has_selected_item = (
             self.loaded_view is not None and self.loaded_view.selected is not None
         )
+        run_all_checked = self.query_one("#run-all", Checkbox).value
+        run_button = self.query_one("#run-pass-button", Button)
+        run_button.label = "Run All" if run_all_checked else "Run Pass"
         controls_disabled = self.run_in_progress
         for selector, widget_type in [
             ("#plan-path", Input),
@@ -1522,9 +1620,7 @@ class PlanExecutorTui(App[None]):
             ("#codex-bin", Input),
         ]:
             self.query_one(selector, widget_type).disabled = controls_disabled
-        self.query_one("#run-pass-button", Button).disabled = (
-            controls_disabled or not has_selected_item
-        )
+        run_button.disabled = controls_disabled or not has_selected_item
 
     async def drain_subprocess_stream(
         self, stream: asyncio.StreamReader | None, stream_name: str
@@ -1546,11 +1642,14 @@ class PlanExecutorTui(App[None]):
         selected_id: str,
         options: plan_executor.TuiOptions,
         result_json_path: Path | None = None,
+        *,
+        mode: Literal["one_pass", "run_all"] = "one_pass",
     ) -> None:
         return_code: int | None = None
         failed = False
         failure_message: str | None = None
-        result_json_path = result_json_path or TUI_RESULT_JSON_PATH
+        if mode == "one_pass":
+            result_json_path = result_json_path or TUI_RESULT_JSON_PATH
         self.current_result_json_path = result_json_path
         if self.active_run is None:
             selected_title = selected_id
@@ -1562,13 +1661,20 @@ class PlanExecutorTui(App[None]):
                 started_at=datetime.now(),
                 options_summary=summarize_tui_options(options),
                 codex_bin=options.codex_bin,
+                mode=mode,
+                max_passes=options.max_passes if mode == "run_all" else None,
             )
             self.render_selection_panel()
-        self.append_log(f"Starting pass {selected_id}.")
+        self.append_log(
+            f"Starting run-all with max passes {options.max_passes}."
+            if mode == "run_all"
+            else f"Starting pass {selected_id}."
+        )
         try:
             argv = plan_executor.build_tui_subprocess_argv(
                 plan_path,
                 options,
+                mode=mode,
                 result_json_path=result_json_path,
             )
             active_run = self.active_run
@@ -1577,18 +1683,19 @@ class PlanExecutorTui(App[None]):
             )
             reset_raw_output_state(
                 self.raw_output_state,
-                selected_id=selected_id,
-                selected_title=selected_title,
+                selected_id="run-all" if mode == "run_all" else selected_id,
+                selected_title="" if mode == "run_all" else selected_title,
                 command=shlex.join(argv),
-                status="Running",
+                status="Running all" if mode == "run_all" else "Running",
             )
             self.reset_raw_output_display(clear_widget=self.active_view == "output")
             self.raw_output_dirty = True
             self.refresh_raw_output_if_visible(auto_scroll=False)
-            try:
-                result_json_path.unlink(missing_ok=True)
-            except OSError as exc:
-                self.append_log(f"Could not clear prior result metadata: {exc}")
+            if result_json_path is not None:
+                try:
+                    result_json_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.append_log(f"Could not clear prior result metadata: {exc}")
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
@@ -1603,7 +1710,8 @@ class PlanExecutorTui(App[None]):
             )
             return_code = await process.wait()
             await asyncio.gather(stdout_task, stderr_task)
-            self.latest_run_metadata = load_latest_run_metadata(result_json_path)
+            if mode == "one_pass" and result_json_path is not None:
+                self.latest_run_metadata = load_latest_run_metadata(result_json_path)
             self.refresh_review_view(auto_scroll=False)
             if return_code == 0:
                 self.update_run_status(f"Finished with return code {return_code}")
@@ -1633,11 +1741,13 @@ class PlanExecutorTui(App[None]):
                     finished_at=datetime.now(),
                     return_code=return_code,
                     failure_message=failure_message,
+                    mode=mode,
                 )
             self.run_in_progress = False
             self.run_process = None
             self.current_run_selected_id = None
             self.current_run_started_at = None
+            self.current_run_mode = None
             self.current_result_json_path = None
             self.active_run = None
             self.refresh_review_view(auto_scroll=False)

@@ -253,3 +253,7 @@ git status --short
 ```
 
 The unit tests should not call real `codex`. Use `--codex-bin` with a fake executable when testing execution paths manually.
+
+### Design Notes
+
+See [docs/agent_loop_design_notes.md](docs/agent_loop_design_notes.md) for the runner/TUI architecture, Textual layout contract, and known rejected approaches.
