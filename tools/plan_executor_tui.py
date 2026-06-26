@@ -22,16 +22,6 @@ from textual.widgets import (
 )
 
 try:
-    from textual.widgets import Log as TextualLog
-except ImportError:
-    TextualLog = None  # type: ignore[assignment]
-
-try:
-    from textual.widgets import RichLog as TextualRichLog
-except ImportError:
-    TextualRichLog = None  # type: ignore[assignment]
-
-try:
     from tools import plan_executor
 except ImportError:
     import plan_executor  # type: ignore[no-redef]
@@ -107,6 +97,13 @@ class PlanBrowseDialog(ModalScreen[Path | None]):
         self.dismiss(None)
 
 
+def render_recent_log_lines(lines: list[str], visible_count: int = 6) -> str:
+    """Render the newest log lines in chronological order."""
+    if visible_count <= 0:
+        return ""
+    return "\n".join(lines[-visible_count:])
+
+
 class PlanExecutorTui(App[None]):
     """Read-only TUI for inspecting plans and composing runner commands."""
 
@@ -116,7 +113,7 @@ class PlanExecutorTui(App[None]):
     }
 
     #top {
-        height: 4;
+        height: 2;
         padding: 0 1 0 1;
     }
 
@@ -152,7 +149,7 @@ class PlanExecutorTui(App[None]):
     }
 
     #main {
-        height: 1fr;
+        height: 10;
     }
 
     #progress {
@@ -174,7 +171,7 @@ class PlanExecutorTui(App[None]):
     }
 
     #log {
-        height: 4;
+        height: 1fr;
         border: round $accent;
         padding: 0 1;
     }
@@ -293,23 +290,9 @@ class PlanExecutorTui(App[None]):
             yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
             # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
             yield Static("", id="command-preview")
-        if TextualLog is not None:
-            log_widget = TextualLog(highlight=False, max_lines=200, auto_scroll=True, id="log")
-            log_widget.border_title = "Log"
-            yield log_widget
-        elif TextualRichLog is not None:
-            log_widget = TextualRichLog(
-                max_lines=200,
-                wrap=True,
-                highlight=False,
-                markup=False,
-                auto_scroll=True,
-                id="log",
-            )
-            log_widget.border_title = "Log"
-            yield log_widget
-        else:
-            yield Static("Log\n", id="log")
+        log_widget = Static("", id="log")
+        log_widget.border_title = "Log"
+        yield log_widget
         yield Footer()
 
     def on_mount(self) -> None:
@@ -479,13 +462,7 @@ class PlanExecutorTui(App[None]):
         line = f"[{stamp}] {message}"
         self.log_lines.append(line)
         self.log_lines = self.log_lines[-200:]
-        log_widget = self.query_one("#log")
-        if TextualLog is not None and isinstance(log_widget, TextualLog):
-            log_widget.write_line(line, scroll_end=True)
-        elif TextualRichLog is not None and isinstance(log_widget, TextualRichLog):
-            log_widget.write(line, scroll_end=True)
-        else:
-            log_widget.update("Log\n" + "\n".join(self.log_lines[-5:]))
+        self.query_one("#log", Static).update(render_recent_log_lines(self.log_lines))
 
 
 def run_tui(initial_plan_path: str | None = None) -> int:

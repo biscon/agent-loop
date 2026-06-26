@@ -19,10 +19,10 @@ INVALID_TUI_PLAN = "docs/runner_compatible_plans.md"
 def import_tui_or_skip():
     try:
         from textual.widgets import Input, Static
-        from tools.plan_executor_tui import PlanExecutorTui
+        from tools.plan_executor_tui import PlanExecutorTui, render_recent_log_lines
     except ImportError as exc:
         raise unittest.SkipTest("Textual is not available") from exc
-    return PlanExecutorTui, Input, Static
+    return PlanExecutorTui, Input, Static, render_recent_log_lines
 
 
 def plan_markdown(state: dict, opener: str = "```plan-state-json") -> str:
@@ -89,7 +89,12 @@ def env_with_fake_git(tmp: Path) -> dict[str, str]:
 
 class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.PlanExecutorTui, self.Input, self.Static = import_tui_or_skip()
+        (
+            self.PlanExecutorTui,
+            self.Input,
+            self.Static,
+            self.render_recent_log_lines,
+        ) = import_tui_or_skip()
 
     def panel_text(self, app, selector: str) -> str:
         return str(app.query_one(selector, self.Static).content)
@@ -118,6 +123,18 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         selection_text = self.panel_text(app, "#selection")
         self.assertIn("Plan ID: agent_loop_test_plan", selection_text)
         self.assertIn("Selected ID: phase_01", selection_text)
+
+    def test_log_helper_renders_newest_messages_in_display_order(self) -> None:
+        lines = [f"line {index}" for index in range(1, 9)]
+        rendered = self.render_recent_log_lines(lines, visible_count=4)
+
+        self.assertEqual(
+            rendered.splitlines(),
+            ["line 5", "line 6", "line 7", "line 8"],
+        )
+
+    def test_log_helper_handles_non_positive_visible_count(self) -> None:
+        self.assertEqual(self.render_recent_log_lines(["line 1"], visible_count=0), "")
 
     async def test_tui_load_button_uses_current_visible_path_after_valid_then_invalid(self) -> None:
         app = self.PlanExecutorTui()
