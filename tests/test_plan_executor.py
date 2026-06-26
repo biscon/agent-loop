@@ -85,7 +85,13 @@ def make_fake_codex(
     status_to_set: str = "Completed",
     expand_plan: bool = False,
     create_artifact: bool = False,
+    review_verdict: str = "pass",
+    review_verdicts: list[str] | None = None,
+    review_invalid_json: bool = False,
+    review_missing_json: bool = False,
+    review_modify_tracked: str | None = None,
 ) -> None:
+    review_verdicts = review_verdicts or []
     script = f"""#!/usr/bin/env python3
 import json
 import sys
@@ -93,12 +99,15 @@ from pathlib import Path
 
 marker_path = Path({str(marker_path)!r})
 prompt = sys.argv[2] if len(sys.argv) > 2 else ""
+is_review = prompt.startswith("Review the implementation diff")
 if marker_path.exists():
     marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
 else:
     marker_data = {{"calls": []}}
 call_number = len(marker_data["calls"]) + 1
-marker_data["calls"].append({{"argv": sys.argv[1:], "prompt": prompt}})
+review_call_number = sum(1 for call in marker_data["calls"] if call.get("kind") == "review") + 1
+kind = "review" if is_review else "implementation"
+marker_data["calls"].append({{"argv": sys.argv[1:], "prompt": prompt, "kind": kind}})
 marker_data["argv"] = sys.argv[1:]
 marker_data["prompt"] = prompt
 marker_path.write_text(json.dumps(marker_data, indent=2), encoding="utf-8")
@@ -108,6 +117,36 @@ print("fake stderr", file=sys.stderr)
 fail_this_call = {fail_on_call!r} is not None and call_number == {fail_on_call!r}
 if fail_this_call and not {fail_after_changes!r}:
     raise SystemExit(7)
+
+if is_review:
+    logs_dir = None
+    for line in prompt.splitlines():
+        if line.startswith("Logs dir: "):
+            logs_dir = Path(line.removeprefix("Logs dir: "))
+            break
+    if logs_dir is None:
+        raise SystemExit("could not parse logs dir from review prompt")
+    verdicts = {review_verdicts!r}
+    verdict = verdicts[review_call_number - 1] if review_call_number <= len(verdicts) else {review_verdict!r}
+    if {review_modify_tracked!r} is not None:
+        Path({review_modify_tracked!r}).write_text("modified by review\\n", encoding="utf-8")
+    if {review_invalid_json!r}:
+        (logs_dir / "review_result.json").write_text("{{not json\\n", encoding="utf-8")
+    elif not {review_missing_json!r}:
+        (logs_dir / "review_result.json").write_text(json.dumps({{
+            "verdict": verdict,
+            "summary": "fake review " + verdict,
+            "issues": [] if verdict == "pass" else [{{
+                "severity": "major",
+                "file": "plan.md",
+                "reason": "fake issue",
+                "suggested_fix": None,
+            }}],
+            "scope_notes": "fake scope notes",
+            "checks_considered": ["git diff", "harness checks", "plan update"],
+        }}, indent=2) + "\\n", encoding="utf-8")
+    (logs_dir / "review_result.md").write_text("# Fake review\\n\\n" + verdict + "\\n", encoding="utf-8")
+    raise SystemExit(0)
 
 if {update_plan!r} or {expand_plan!r} or {create_artifact!r} or fail_this_call:
     first_line = prompt.splitlines()[0]
@@ -191,15 +230,16 @@ def require_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return completed
 
 
-def init_temp_git_repo(repo: Path) -> None:
+def init_temp_git_repo(repo: Path, create_gitignore: bool = True) -> None:
     repo.mkdir()
     require_git(repo, "init")
     require_git(repo, "config", "user.name", "Plan Executor Test")
     require_git(repo, "config", "user.email", "plan-executor-test@example.com")
-    (repo / ".gitignore").write_text(
-        ".agent-runs/\nagent_loop_sandbox/\n__pycache__/\n*.pyc\n",
-        encoding="utf-8",
-    )
+    if create_gitignore:
+        (repo / ".gitignore").write_text(
+            ".agent-runs/\nagent_loop_sandbox/\n__pycache__/\n*.pyc\n",
+            encoding="utf-8",
+        )
 
 
 def commit_all(repo: Path, message: str) -> None:
@@ -210,6 +250,12 @@ def commit_all(repo: Path, message: str) -> None:
 def commit_count(repo: Path) -> int:
     completed = require_git(repo, "rev-list", "--count", "HEAD")
     return int(completed.stdout.strip())
+
+
+def local_exclude_path(repo: Path) -> Path:
+    path_text = require_git(repo, "rev-parse", "--git-path", "info/exclude").stdout.strip()
+    path = Path(path_text)
+    return path if path.is_absolute() else repo / path
 
 
 class PlanExecutorTests(unittest.TestCase):
@@ -464,6 +510,7 @@ class PlanExecutorTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                cwd=tmp,
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -607,6 +654,7 @@ class PlanExecutorTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                cwd=tmp,
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -1063,6 +1111,131 @@ class PlanExecutorTests(unittest.TestCase):
             self.assertIn("fake stdout", (logs_dir / "codex_stdout.txt").read_text())
             self.assertIn("fake stderr", (logs_dir / "codex_stderr.txt").read_text())
 
+    def test_local_git_exclude_is_bootstrapped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            init_temp_git_repo(repo, create_gitignore=False)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+
+            completed = subprocess.run(
+                CLI + [str(plan_file), "--status"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            exclude_text = local_exclude_path(repo).read_text(encoding="utf-8")
+            self.assertIn(".agent-runs/", exclude_text)
+            self.assertIn("agent_loop_sandbox/", exclude_text)
+            self.assertIn("__pycache__/", exclude_text)
+            self.assertIn("*.pyc", exclude_text)
+            self.assertFalse((repo / ".gitignore").exists())
+            self.assertEqual(require_git(repo, "status", "--porcelain").stdout, "")
+
+    def test_local_git_exclude_bootstrap_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            init_temp_git_repo(repo, create_gitignore=False)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+
+            for _ in range(2):
+                completed = subprocess.run(
+                    CLI + [str(plan_file), "--status"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            exclude_text = local_exclude_path(repo).read_text(encoding="utf-8")
+            self.assertEqual(
+                exclude_text.count("# plan_executor local transient outputs"),
+                1,
+            )
+            self.assertEqual(exclude_text.count(".agent-runs/"), 1)
+            self.assertEqual(exclude_text.count("agent_loop_sandbox/"), 1)
+            self.assertEqual(exclude_text.count("__pycache__/"), 1)
+            self.assertEqual(exclude_text.count("*.pyc"), 1)
+
+    def test_commit_after_pass_bootstraps_exclude_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            init_temp_git_repo(repo, create_gitignore=False)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, create_artifact=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--commit-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            output = completed.stdout
+            self.assertIn(
+                "Updated local git exclude with plan executor transient patterns:",
+                output,
+            )
+            self.assertIn("Commit preflight: git worktree is clean.", output)
+            self.assertLess(
+                output.index("Updated local git exclude"),
+                output.index("Commit preflight"),
+            )
+            self.assertEqual(commit_count(repo), 2)
+            committed_paths = require_git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout
+            self.assertIn("plan.md", committed_paths)
+            self.assertIn("artifacts/phase_01.txt", committed_paths)
+            self.assertNotIn(".agent-runs/", committed_paths)
+            self.assertEqual(require_git(repo, "status", "--porcelain").stdout, "")
+
+    def test_bootstrap_does_not_call_real_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            init_temp_git_repo(repo, create_gitignore=False)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--status",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(marker.exists())
+            exclude_text = local_exclude_path(repo).read_text(encoding="utf-8")
+            self.assertIn(".agent-runs/", exclude_text)
+
     def test_commit_after_pass_requires_clean_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1255,6 +1428,373 @@ class PlanExecutorTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(commit_count(repo), 1)
 
+    def test_review_after_successful_pass_writes_review_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, review_verdict="pass")
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual([call["kind"] for call in marker_data["calls"]], ["implementation", "review"])
+            logs_dir = next((tmp_path / ".agent-runs").glob("in-place-test_plan-*/logs/*"))
+            for name in (
+                "review_prompt.txt",
+                "review_stdout.txt",
+                "review_stderr.txt",
+                "review_returncode.txt",
+                "review_result.json",
+                "review_result.md",
+                "review_git_status_before.txt",
+                "review_git_status_after.txt",
+                "review_git_diff_fingerprint_before.txt",
+                "review_git_diff_fingerprint_after.txt",
+                "implementation_git_status_before.txt",
+                "implementation_git_diff_before.patch",
+                "implementation_git_diff_stat_before.txt",
+                "implementation_git_status_after.txt",
+                "implementation_git_diff_after.patch",
+                "implementation_git_diff_stat_after.txt",
+                "implementation_git_name_status_after.txt",
+            ):
+                self.assertTrue((logs_dir / name).exists(), name)
+            self.assertIn("Verdict: pass", completed.stdout)
+
+    def test_review_after_pass_stops_on_needs_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            init_temp_git_repo(repo)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(
+                fake_codex,
+                marker,
+                update_plan=True,
+                create_artifact=True,
+                review_verdict="needs_fix",
+            )
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--commit-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("Stop reason: review_needs_fix", completed.stdout)
+            self.assertEqual(commit_count(repo), 1)
+
+    def test_review_after_pass_stops_on_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, review_verdict="needs_human")
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("Stop reason: review_needs_human", completed.stdout)
+
+    def test_review_after_pass_invalid_json_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, review_invalid_json=True)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("Stop reason: review_invalid_json", completed.stdout)
+            logs_dir = next((tmp_path / ".agent-runs").glob("in-place-test_plan-*/logs/*"))
+            self.assertIn(
+                "invalid review JSON",
+                (logs_dir / "review_parse_error.txt").read_text(encoding="utf-8"),
+            )
+
+    def test_review_after_pass_not_run_when_execution_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, fail_on_call=1)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual([call["kind"] for call in marker_data["calls"]], ["implementation"])
+
+    def test_review_after_pass_detects_worktree_modification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            init_temp_git_repo(repo)
+            plan_file = repo / "plan.md"
+            tracked_file = repo / "tracked.txt"
+            write_plan(plan_file, base_state(phase_items(1)))
+            tracked_file.write_text("initial\n", encoding="utf-8")
+            commit_all(repo, "initial")
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(
+                fake_codex,
+                marker,
+                update_plan=True,
+                review_verdict="pass",
+                review_modify_tracked=str(tracked_file),
+            )
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("review_modified_worktree", completed.stdout)
+
+    def test_commit_after_pass_waits_for_review_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            init_temp_git_repo(repo)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(
+                fake_codex,
+                marker,
+                update_plan=True,
+                create_artifact=True,
+                review_verdict="pass",
+            )
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--commit-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(commit_count(repo), 2)
+            body = require_git(repo, "log", "-1", "--format=%B").stdout
+            self.assertIn("Review requested: True", body)
+            self.assertIn("Review verdict: pass", body)
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual([call["kind"] for call in marker_data["calls"]], ["implementation", "review"])
+
+    def test_commit_after_pass_skips_commit_when_review_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            init_temp_git_repo(repo)
+            plan_file = repo / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            commit_all(repo, "initial")
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(
+                fake_codex,
+                marker,
+                update_plan=True,
+                create_artifact=True,
+                review_verdict="needs_fix",
+            )
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--commit-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(commit_count(repo), 1)
+
+    def test_run_all_stops_on_review_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, base_state(phase_items(3)))
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(
+                fake_codex,
+                marker,
+                update_plan=True,
+                review_verdicts=["pass", "needs_fix"],
+            )
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--run-all",
+                    "--review-after-pass",
+                    "--max-passes",
+                    "5",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=tmp,
+                env=env_with_fake_git(tmp_path),
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("review diff is cumulative", completed.stderr)
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [call["kind"] for call in marker_data["calls"]],
+                ["implementation", "review", "implementation", "review"],
+            )
+            summary = json.loads(
+                next((tmp_path / ".agent-runs").glob("in-place-test_plan-*/run_all_summary.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(summary["passes"][-1]["review_verdict"], "needs_fix")
+            self.assertEqual(summary["passes"][-1]["review_stop_reason"], "review_needs_fix")
+            state = plan_executor.load_json_state(plan_file)
+            self.assertEqual(state["items"][2]["status"], "Not Started")
+
+    def test_review_after_pass_uses_fake_codex_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, base_state(phase_items(1)))
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True, review_verdict="pass")
+            trap_bin = tmp_path / "bin"
+            trap_bin.mkdir()
+            trap_codex = trap_bin / "codex"
+            trap_codex.write_text(
+                "#!/bin/sh\necho real codex should not run >&2\nexit 99\n",
+                encoding="utf-8",
+            )
+            trap_codex.chmod(trap_codex.stat().st_mode | 0o111)
+            make_fake_git(trap_bin / "git")
+            env = dict(os.environ)
+            env["PATH"] = f"{trap_bin}:{env['PATH']}"
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--review-after-pass",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                cwd=tmp,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotIn("real codex should not run", completed.stderr)
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(len(marker_data["calls"]), 2)
+
     def test_no_commit_when_commit_not_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1296,6 +1836,7 @@ class PlanExecutorTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                cwd=tmp,
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)

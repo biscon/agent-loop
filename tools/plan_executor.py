@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import shutil
 import subprocess
@@ -22,6 +23,15 @@ PLAN_COPY_NAME = "plan.md"
 WORKSPACE_DIR_NAME = "workspace"
 SANDBOX_DIR_NAME = "agent_loop_sandbox"
 LOGS_DIR_NAME = "logs"
+LOCAL_GIT_EXCLUDE_COMMENT = "# plan_executor local transient outputs"
+LOCAL_GIT_EXCLUDE_PATTERNS = (
+    ".agent-runs/",
+    "agent_loop_sandbox/",
+    "__pycache__/",
+    "*.pyc",
+)
+REVIEW_VERDICTS = {"pass", "needs_fix", "needs_human"}
+REVIEW_ISSUE_SEVERITIES = {"blocker", "major", "minor"}
 
 
 def positive_int(value: str) -> int:
@@ -134,7 +144,52 @@ class ExecutionResult:
     harness_checks: list[HarnessCheck]
     prompt: str
     same_selection_warning: str | None = None
+    review: "ReviewResult | None" = None
     commit: "CommitResult | None" = None
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    requested: bool
+    attempted: bool = False
+    returncode: int | None = None
+    verdict: str | None = None
+    summary: str | None = None
+    result_json_path: Path | None = None
+    result_md_path: Path | None = None
+    stop_reason: str | None = None
+
+    @classmethod
+    def not_requested(cls) -> "ReviewResult":
+        return cls(requested=False)
+
+    @classmethod
+    def not_attempted(cls, reason: str) -> "ReviewResult":
+        return cls(requested=True, attempted=False, stop_reason=reason)
+
+    def failed(self) -> bool:
+        return self.requested and self.stop_reason is not None
+
+    def to_json_obj(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"review_requested": self.requested}
+        if not self.requested:
+            return data
+        data.update(
+            {
+                "review_attempted": self.attempted,
+                "review_returncode": self.returncode,
+                "review_verdict": self.verdict,
+                "review_summary": self.summary,
+                "review_result_json": (
+                    str(self.result_json_path) if self.result_json_path is not None else None
+                ),
+                "review_result_md": (
+                    str(self.result_md_path) if self.result_md_path is not None else None
+                ),
+                "review_stop_reason": self.stop_reason,
+            }
+        )
+        return data
 
 
 @dataclass(frozen=True)
@@ -185,6 +240,7 @@ class RunAllRecord:
     selected_after_id: str | None = None
     selected_after_title: str | None = None
     selected_item_post_status: str | None = None
+    review: ReviewResult | None = None
     commit: CommitResult | None = None
 
     def to_json_obj(self) -> dict[str, Any]:
@@ -198,6 +254,7 @@ class RunAllRecord:
             "selected_after_title": self.selected_after_title,
             "selected_item_post_status": self.selected_item_post_status,
         }
+        data.update((self.review or ReviewResult.not_requested()).to_json_obj())
         data.update((self.commit or CommitResult.not_requested()).to_json_obj())
         return data
 
@@ -251,7 +308,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--commit-after-pass",
         action="store_true",
-        help="Commit git changes after each successful executed pass.",
+        help=(
+            "Commit source changes and active plan progress after each successful "
+            "executed pass; local .agent-runs/ logs are transient and not committed."
+        ),
+    )
+    parser.add_argument(
+        "--review-after-pass",
+        action="store_true",
+        help="Run a read-only agent review after each successful executed pass.",
     )
     parser.add_argument(
         "--commit-prefix",
@@ -716,6 +781,91 @@ Important:
 """
 
 
+def build_review_prompt(
+    plan_file: Path,
+    selected_item: PlanItem,
+    status_after: str,
+    logs_dir: Path,
+) -> str:
+    result_json = logs_dir / "review_result.json"
+    result_md = logs_dir / "review_result.md"
+    return f"""Review the implementation diff for the selected plan item only.
+
+Active plan file: {plan_file}
+Selected item id: {selected_item.id}
+Selected item title: {selected_item.title}
+Selected item status after implementation: {status_after}
+Logs dir: {logs_dir}
+
+Read the active plan file and these per-pass artifacts:
+- {logs_dir / "selection_before.json"}
+- {logs_dir / "selection_after.json"}
+- {logs_dir / "plan_before.md"}
+- {logs_dir / "plan_after.md"}
+- {logs_dir / "codex_stdout.txt"}
+- {logs_dir / "codex_stderr.txt"}
+- {logs_dir / "harness_checks.json"}
+- {logs_dir / "implementation_git_status_before.txt"}
+- {logs_dir / "implementation_git_diff_before.patch"}
+- {logs_dir / "implementation_git_diff_stat_before.txt"}
+- {logs_dir / "implementation_git_status_after.txt"}
+- {logs_dir / "implementation_git_diff_after.patch"}
+- {logs_dir / "implementation_git_diff_stat_after.txt"}
+- {logs_dir / "implementation_git_name_status_after.txt"}
+
+Inspect the current git diff and changed files as needed.
+
+The current git diff may include changes from earlier uncommitted passes.
+Use the before/after implementation snapshots and plan_before/plan_after to focus on the selected item for this pass.
+
+Verify scope discipline:
+- Did the changes match the selected plan item?
+- Did the implementation accidentally broaden the task?
+- Did the plan update match the source changes?
+- Did it change behavior that the plan said should remain unchanged?
+
+Look for likely code issues:
+- compile errors visible from changed code
+- stale names/includes
+- dependency direction regressions
+- missing call-site updates
+- suspicious test updates
+- accidental source/hash/serialization/collision/camera behavior changes
+
+Do not edit source files.
+Do not update the active plan.
+Do not commit.
+Do not run gh.
+Do not push.
+Only write review artifacts under {logs_dir}.
+
+Write valid JSON to {result_json} with this shape:
+{{
+  "verdict": "pass",
+  "summary": "Short review summary.",
+  "issues": [],
+  "scope_notes": "Notes about whether the diff stayed within scope.",
+  "checks_considered": [
+    "git diff",
+    "harness checks",
+    "plan update"
+  ]
+}}
+
+Allowed verdicts: pass, needs_fix, needs_human.
+Issue objects must use this shape:
+{{
+  "severity": "blocker",
+  "file": "path/to/file.cpp",
+  "reason": "What looks wrong.",
+  "suggested_fix": "Concrete suggested fix or null."
+}}
+Allowed issue severities: blocker, major, minor.
+
+Also write a human-readable review report to {result_md}.
+"""
+
+
 def write_text_file(path: Path, text: str) -> None:
     try:
         path.write_text(text, encoding="utf-8")
@@ -757,6 +907,131 @@ def run_git_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True)
 
 
+def write_git_command_output(path: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
+    completed = run_git_command(command)
+    text = completed.stdout
+    if completed.returncode != 0 and completed.stderr:
+        text += completed.stderr
+    write_command_output(path, text)
+    return completed
+
+
+def write_implementation_git_snapshots(logs_dir: Path, suffix: str) -> None:
+    write_git_command_output(
+        logs_dir / f"implementation_git_status_{suffix}.txt",
+        ["git", "status", "--porcelain"],
+    )
+    write_git_command_output(
+        logs_dir / f"implementation_git_diff_{suffix}.patch",
+        ["git", "diff", "--binary"],
+    )
+    write_git_command_output(
+        logs_dir / f"implementation_git_diff_stat_{suffix}.txt",
+        ["git", "diff", "--stat"],
+    )
+    if suffix == "after":
+        write_git_command_output(
+            logs_dir / "implementation_git_name_status_after.txt",
+            ["git", "diff", "--name-status"],
+        )
+
+
+def git_worktree_fingerprint() -> tuple[str, str, str]:
+    status = run_git_command(["git", "status", "--porcelain"])
+    diff = run_git_command(["git", "diff", "--binary"])
+    status_text = status.stdout
+    diff_text = diff.stdout
+    digest = hashlib.sha256()
+    digest.update(status_text.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(diff_text.encode("utf-8"))
+    return digest.hexdigest(), status_text, diff_text
+
+
+def write_review_fingerprint(path: Path, fingerprint: str) -> None:
+    write_command_output(path, fingerprint + "\n")
+
+
+def resolve_git_path(path_text: str) -> Path:
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def local_git_exclude_path() -> Path | None:
+    top_level = run_git_command(["git", "rev-parse", "--show-toplevel"])
+    if top_level.returncode != 0 or not top_level.stdout.strip():
+        return None
+
+    exclude_path = run_git_command(["git", "rev-parse", "--git-path", "info/exclude"])
+    if exclude_path.returncode != 0 or not exclude_path.stdout.strip():
+        return None
+
+    return resolve_git_path(exclude_path.stdout.strip())
+
+
+def warn_if_transient_paths_tracked() -> None:
+    tracked = run_git_command(["git", "ls-files", ".agent-runs", "agent_loop_sandbox"])
+    if tracked.returncode == 0 and tracked.stdout.strip():
+        print(
+            "Warning: executor transient paths are already tracked by git. "
+            "Ignoring will not untrack existing files.",
+            file=sys.stderr,
+        )
+
+
+def ensure_local_git_exclude(verbose: bool) -> None:
+    exclude_path = local_git_exclude_path()
+    if exclude_path is None:
+        return
+
+    try:
+        if exclude_path.exists():
+            existing_text = exclude_path.read_text(encoding="utf-8")
+        else:
+            existing_text = ""
+    except OSError as exc:
+        raise PlanError(f"{exclude_path}: failed to read local git exclude: {exc}") from exc
+
+    existing_patterns = {
+        line.strip()
+        for line in existing_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    missing_patterns = [
+        pattern for pattern in LOCAL_GIT_EXCLUDE_PATTERNS if pattern not in existing_patterns
+    ]
+
+    if not missing_patterns:
+        if verbose:
+            print(
+                "Local git exclude already contains plan executor transient patterns: "
+                f"{exclude_path}",
+                file=sys.stderr,
+            )
+        warn_if_transient_paths_tracked()
+        return
+
+    lines_to_append = [LOCAL_GIT_EXCLUDE_COMMENT, *missing_patterns]
+    separator = "" if not existing_text or existing_text.endswith("\n") else "\n"
+    appended_text = separator + "\n".join(lines_to_append) + "\n"
+
+    try:
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        with exclude_path.open("a", encoding="utf-8") as handle:
+            handle.write(appended_text)
+    except OSError as exc:
+        raise PlanError(f"{exclude_path}: failed to update local git exclude: {exc}") from exc
+
+    print(
+        "Updated local git exclude with plan executor transient patterns: "
+        f"{exclude_path}",
+        file=sys.stderr,
+    )
+    warn_if_transient_paths_tracked()
+
+
 def require_clean_worktree_for_commits() -> None:
     completed = run_git_command(["git", "status", "--porcelain"])
     if completed.returncode != 0:
@@ -789,17 +1064,27 @@ def commit_body(
     selected_item: PlanItem,
     status_after: str,
     logs_dir: Path,
+    review: ReviewResult | None,
 ) -> str:
-    return "\n".join(
+    lines = [
+        "Automated plan executor pass.",
+        "",
+        f"Plan: {plan_file}",
+        f"Selected item: {selected_item.id} - {selected_item.title}",
+        f"Status after: {status_after}",
+        f"Logs: {logs_dir}",
+    ]
+    review = review or ReviewResult.not_requested()
+    lines.extend(
         [
-            "Automated plan executor pass.",
-            "",
-            f"Plan: {plan_file}",
-            f"Selected item: {selected_item.id} - {selected_item.title}",
-            f"Status after: {status_after}",
-            f"Logs: {logs_dir}",
+            f"Review requested: {review.requested}",
+            f"Review verdict: {review.verdict}",
+            f"Review summary: {review.summary}",
+            f"Review result JSON: {review.result_json_path}",
+            f"Review result MD: {review.result_md_path}",
         ]
     )
+    return "\n".join(lines)
 
 
 def write_command_output(path: Path, text: str) -> None:
@@ -962,6 +1247,7 @@ def attempt_git_commit(
         selected_item,
         status_after or "",
         logs_dir,
+        result.review,
     )
     commit = run_git_command(["git", "commit", "-m", subject, "-m", body])
     write_command_output(logs_dir / "git_commit_stdout.txt", commit.stdout)
@@ -1020,6 +1306,10 @@ def apply_commit_if_eligible(
     if not harness_checks_passed(result):
         return replace(result, commit=commit_not_eligible("harness failed"))
 
+    if result.review is not None and result.review.requested:
+        if result.review.verdict != "pass" or result.review.stop_reason is not None:
+            return replace(result, commit=commit_not_eligible("review did not pass"))
+
     status_after = selected_item_status_after(plan_state_after, result.selected_before)
     if status_after not in DONE_STATUSES:
         return replace(result, commit=commit_not_eligible("selected item not completed"))
@@ -1034,7 +1324,12 @@ def stream_pipe(pipe: Any, prefix: str, sink: Any, collected: list[str]) -> None
         print(f"{prefix}{line}", end="", file=sink)
 
 
-def run_codex_exec(codex_bin: str, prompt: str) -> tuple[int, str, str]:
+def run_codex_exec(
+    codex_bin: str,
+    prompt: str,
+    stdout_prefix: str = "[codex] ",
+    stderr_prefix: str = "[codex:stderr] ",
+) -> tuple[int, str, str]:
     try:
         process = subprocess.Popen(
             [codex_bin, "exec", prompt],
@@ -1052,11 +1347,11 @@ def run_codex_exec(codex_bin: str, prompt: str) -> tuple[int, str, str]:
     assert process.stderr is not None
     stdout_thread = threading.Thread(
         target=stream_pipe,
-        args=(process.stdout, "[codex] ", sys.stdout, stdout_lines),
+        args=(process.stdout, stdout_prefix, sys.stdout, stdout_lines),
     )
     stderr_thread = threading.Thread(
         target=stream_pipe,
-        args=(process.stderr, "[codex:stderr] ", sys.stderr, stderr_lines),
+        args=(process.stderr, stderr_prefix, sys.stderr, stderr_lines),
     )
     stdout_thread.start()
     stderr_thread.start()
@@ -1064,6 +1359,176 @@ def run_codex_exec(codex_bin: str, prompt: str) -> tuple[int, str, str]:
     stdout_thread.join()
     stderr_thread.join()
     return returncode, "".join(stdout_lines), "".join(stderr_lines)
+
+
+def validate_review_result(raw: Any, path: Path) -> tuple[str, str]:
+    if not isinstance(raw, dict):
+        raise PlanError(f"{path}: review result must be a JSON object")
+    verdict = raw.get("verdict")
+    if verdict not in REVIEW_VERDICTS:
+        raise PlanError(f"{path}: review verdict must be one of pass, needs_fix, needs_human")
+    summary = raw.get("summary")
+    if not isinstance(summary, str):
+        raise PlanError(f"{path}: review summary must be a string")
+    issues = raw.get("issues")
+    if not isinstance(issues, list):
+        raise PlanError(f"{path}: review issues must be a list")
+    for index, issue in enumerate(issues):
+        if not isinstance(issue, dict):
+            raise PlanError(f"{path}: review issue {index} must be an object")
+        if issue.get("severity") not in REVIEW_ISSUE_SEVERITIES:
+            raise PlanError(
+                f"{path}: review issue {index} severity must be blocker, major, or minor"
+            )
+        if not isinstance(issue.get("file"), str):
+            raise PlanError(f"{path}: review issue {index} file must be a string")
+        if not isinstance(issue.get("reason"), str):
+            raise PlanError(f"{path}: review issue {index} reason must be a string")
+        suggested_fix = issue.get("suggested_fix")
+        if suggested_fix is not None and not isinstance(suggested_fix, str):
+            raise PlanError(
+                f"{path}: review issue {index} suggested_fix must be a string or null"
+            )
+    return verdict, summary
+
+
+def parse_review_result_json(path: Path) -> tuple[str, str]:
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PlanError(f"{path}: missing review_result.json: {exc}") from exc
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise PlanError(
+            f"{path}: invalid review JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    return validate_review_result(raw, path)
+
+
+def run_review_after_pass(
+    plan_files: PlanFiles,
+    result: ExecutionResult,
+    plan_state_after: PlanState,
+    codex_bin: str,
+) -> ExecutionResult:
+    selected_item = result.selected_before.item
+    if selected_item is None:
+        return replace(result, review=ReviewResult.not_attempted("no selected item"))
+
+    status_after = selected_item_status_after(plan_state_after, result.selected_before)
+    if status_after not in DONE_STATUSES:
+        return replace(result, review=ReviewResult.not_attempted("selected item not completed"))
+
+    logs_dir = result.logs_dir
+    result_json_path = logs_dir / "review_result.json"
+    result_md_path = logs_dir / "review_result.md"
+    prompt = build_review_prompt(plan_files.plan_file, selected_item, status_after, logs_dir)
+    write_text_file(logs_dir / "review_prompt.txt", prompt)
+
+    fingerprint_before, status_before, _diff_before = git_worktree_fingerprint()
+    write_command_output(logs_dir / "review_git_status_before.txt", status_before)
+    write_review_fingerprint(
+        logs_dir / "review_git_diff_fingerprint_before.txt",
+        fingerprint_before,
+    )
+
+    try:
+        returncode, stdout, stderr = run_codex_exec(
+            codex_bin,
+            prompt,
+            stdout_prefix="[review] ",
+            stderr_prefix="[review:stderr] ",
+        )
+    except OSError as exc:
+        write_text_file(logs_dir / "review_error.txt", str(exc) + "\n")
+        fingerprint_after, status_after_text, _diff_after = git_worktree_fingerprint()
+        write_command_output(logs_dir / "review_git_status_after.txt", status_after_text)
+        write_review_fingerprint(
+            logs_dir / "review_git_diff_fingerprint_after.txt",
+            fingerprint_after,
+        )
+        review = ReviewResult(
+            requested=True,
+            attempted=True,
+            result_json_path=result_json_path,
+            result_md_path=result_md_path,
+            stop_reason="review_launch_failed",
+        )
+        return replace(result, review=review)
+
+    write_text_file(logs_dir / "review_stdout.txt", stdout)
+    write_text_file(logs_dir / "review_stderr.txt", stderr)
+    write_text_file(logs_dir / "review_returncode.txt", f"{returncode}\n")
+
+    fingerprint_after, status_after_text, _diff_after = git_worktree_fingerprint()
+    write_command_output(logs_dir / "review_git_status_after.txt", status_after_text)
+    write_review_fingerprint(
+        logs_dir / "review_git_diff_fingerprint_after.txt",
+        fingerprint_after,
+    )
+
+    if fingerprint_after != fingerprint_before:
+        review = ReviewResult(
+            requested=True,
+            attempted=True,
+            returncode=returncode,
+            result_json_path=result_json_path,
+            result_md_path=result_md_path,
+            stop_reason="review_modified_worktree",
+        )
+        return replace(result, review=review)
+
+    if returncode != 0:
+        review = ReviewResult(
+            requested=True,
+            attempted=True,
+            returncode=returncode,
+            result_json_path=result_json_path,
+            result_md_path=result_md_path,
+            stop_reason="review_codex_failed",
+        )
+        return replace(result, review=review)
+
+    try:
+        verdict, summary = parse_review_result_json(result_json_path)
+    except PlanError as exc:
+        write_text_file(logs_dir / "review_parse_error.txt", str(exc) + "\n")
+        review = ReviewResult(
+            requested=True,
+            attempted=True,
+            returncode=returncode,
+            result_json_path=result_json_path,
+            result_md_path=result_md_path,
+            stop_reason="review_invalid_json",
+        )
+        return replace(result, review=review)
+
+    if not result_md_path.exists():
+        review = ReviewResult(
+            requested=True,
+            attempted=True,
+            returncode=returncode,
+            verdict=verdict,
+            summary=summary,
+            result_json_path=result_json_path,
+            result_md_path=result_md_path,
+            stop_reason="review_missing_markdown",
+        )
+        return replace(result, review=review)
+
+    stop_reason = None if verdict == "pass" else f"review_{verdict}"
+    review = ReviewResult(
+        requested=True,
+        attempted=True,
+        returncode=returncode,
+        verdict=verdict,
+        summary=summary,
+        result_json_path=result_json_path,
+        result_md_path=result_md_path,
+        stop_reason=stop_reason,
+    )
+    return replace(result, review=review)
 
 
 def execute_next(
@@ -1088,6 +1553,7 @@ def execute_next(
     plan_backup_before = logs_dir / "plan_before.md"
     plan_backup_after = logs_dir / "plan_after.md"
     copy_plan_backup(plan_files.plan_file, plan_backup_before)
+    write_implementation_git_snapshots(logs_dir, "before")
 
     prompt = build_codex_prompt(plan_files.plan_file, selected_before.item.id)
     write_text_file(logs_dir / "codex_prompt.txt", prompt)
@@ -1104,6 +1570,7 @@ def execute_next(
     write_text_file(logs_dir / "codex_stderr.txt", codex_stderr)
     write_text_file(logs_dir / "codex_returncode.txt", f"{codex_returncode}\n")
     copy_plan_backup(plan_files.plan_file, plan_backup_after)
+    write_implementation_git_snapshots(logs_dir, "after")
 
     plan_state_after = load_plan_state_from_file(plan_files.plan_file)
     selected_after = select_next_item(plan_state_after, include_parents=include_parents)
@@ -1135,6 +1602,7 @@ def execute_next(
         harness_checks=harness_checks,
         prompt=prompt,
         same_selection_warning=same_selection_warning,
+        review=ReviewResult.not_requested(),
     )
 
 
@@ -1240,6 +1708,25 @@ def print_commit_result(commit: CommitResult | None) -> None:
         print(f"Staged name-status log: {commit.cached_name_status_path}")
 
 
+def print_review_result(review: ReviewResult | None) -> None:
+    review = review or ReviewResult.not_requested()
+    print("Review:")
+    print(f"Requested: {review.requested}")
+    if not review.requested:
+        return
+    print(f"Attempted: {review.attempted}")
+    if review.returncode is not None:
+        print(f"Return code: {review.returncode}")
+    if review.verdict is not None:
+        print(f"Verdict: {review.verdict}")
+    if review.summary is not None:
+        print(f"Summary: {review.summary}")
+    if review.result_md_path is not None:
+        print(f"Review result: {review.result_md_path}")
+    if review.stop_reason is not None:
+        print(f"Stop reason: {review.stop_reason}")
+
+
 def print_execution_output(
     plan_files: PlanFiles,
     plan_state_before: PlanState,
@@ -1266,6 +1753,8 @@ def print_execution_output(
         print(f"Warning: {result.same_selection_warning}")
     print()
     print_harness_checks(result.harness_checks)
+    print()
+    print_review_result(result.review)
     print()
     print_commit_result(result.commit)
 
@@ -1326,6 +1815,7 @@ def build_execution_json_output(
     output["plan_backup_before"] = str(result.plan_backup_before)
     output["plan_backup_after"] = str(result.plan_backup_after)
     output["harness_checks"] = [check.to_json_obj() for check in result.harness_checks]
+    output.update((result.review or ReviewResult.not_requested()).to_json_obj())
     output.update((result.commit or CommitResult.not_requested()).to_json_obj())
     if result.same_selection_warning is not None:
         output["warning"] = result.same_selection_warning
@@ -1333,6 +1823,10 @@ def build_execution_json_output(
 
 
 def command_exit_code(result: ExecutionResult) -> int:
+    if result.review is not None and result.review.failed():
+        if result.review.returncode not in (None, 0):
+            return result.review.returncode
+        return 1
     if commit_result_failed(result.commit):
         return result.commit.returncode or 1
     for check in result.harness_checks:
@@ -1358,7 +1852,13 @@ def write_run_all_summary(run_dir: Path, records: list[RunAllRecord], stop_reaso
     lines = ["Run-all summary:"]
     for record in records:
         commit = record.commit or CommitResult.not_requested()
+        review = record.review or ReviewResult.not_requested()
         line = f"- {record.selected_id}: {record.status}"
+        if review.requested:
+            if review.verdict:
+                line += f" review={review.verdict}"
+            elif review.stop_reason:
+                line += f" review_stop={review.stop_reason}"
         if commit.requested:
             if commit.created:
                 line += f" commit={commit.hash}"
@@ -1373,7 +1873,13 @@ def print_run_all_summary(records: list[RunAllRecord], stop_reason: str) -> None
     print("Run-all summary:")
     for record in records:
         commit = record.commit or CommitResult.not_requested()
+        review = record.review or ReviewResult.not_requested()
         line = f"- {record.selected_id}: {record.status}"
+        if review.requested:
+            if review.verdict:
+                line += f" review={review.verdict}"
+            elif review.stop_reason:
+                line += f" review_stop={review.stop_reason}"
         if commit.requested:
             if commit.created:
                 line += f" commit={commit.hash}"
@@ -1442,6 +1948,7 @@ def run_all(
     include_parents: bool,
     codex_bin: str,
     verbose: bool,
+    review_after_pass: bool,
     commit_after_pass: bool,
     commit_prefix: str,
 ) -> int:
@@ -1488,6 +1995,7 @@ def run_all(
                 selected_title=selection_before.item.title,
                 status="parse_failed",
                 logs_dir=str(logs_dir),
+                review=ReviewResult.not_attempted("parse failed") if review_after_pass else None,
                 commit=commit_not_eligible("parse failed") if commit_after_pass else None,
             )
             records.append(record)
@@ -1509,13 +2017,18 @@ def run_all(
                 selection_before.item.id,
                 selection_before.item,
             ).status,
+            review=ReviewResult.not_requested(),
             commit=CommitResult.not_requested(),
         )
+        if review_after_pass:
+            record.review = ReviewResult.not_attempted("pass not review-eligible")
         if commit_after_pass:
             record.commit = commit_not_eligible("pass not commit-eligible")
 
         if result.codex_returncode != 0:
             record.status = "codex_failed"
+            if review_after_pass:
+                record.review = ReviewResult.not_attempted("Codex failed")
             if commit_after_pass:
                 record.commit = commit_not_eligible("Codex failed")
             records.append(record)
@@ -1527,6 +2040,8 @@ def run_all(
 
         if not harness_checks_passed(result):
             record.status = "harness_failed"
+            if review_after_pass:
+                record.review = ReviewResult.not_attempted("harness failed")
             if commit_after_pass:
                 record.commit = commit_not_eligible("harness failed")
             records.append(record)
@@ -1544,6 +2059,8 @@ def run_all(
         )
 
         if record.status != "passed":
+            if review_after_pass:
+                record.review = ReviewResult.not_attempted(stop_reason)
             if commit_after_pass:
                 record.commit = commit_not_eligible(stop_reason)
             records.append(record)
@@ -1551,6 +2068,25 @@ def run_all(
             print(f"Run-all stopped: {stop_reason}.")
             print_run_all_summary(records, stop_reason)
             return 1
+
+        if review_after_pass:
+            result = run_review_after_pass(
+                plan_files,
+                result,
+                plan_state_after,
+                codex_bin=codex_bin,
+            )
+            record.review = result.review
+            if result.review is not None and result.review.failed():
+                record.status = result.review.stop_reason or "review_failed"
+                if commit_after_pass:
+                    record.commit = commit_not_eligible("review did not pass")
+                records.append(record)
+                stop_reason = result.review.stop_reason or "review failed"
+                write_run_all_summary(plan_files.run_dir, records, stop_reason)
+                print_review_result(result.review)
+                print_run_all_summary(records, stop_reason)
+                return command_exit_code(result)
 
         result = apply_commit_if_eligible(
             plan_files,
@@ -1577,6 +2113,7 @@ def run_all(
         print(f"Codex return code: {result.codex_returncode}")
         print(f"Next selected: {next_text}")
         print("Harness checks: passed")
+        print_review_result(result.review)
         print_commit_result(result.commit)
 
         if result.selected_after.item is None:
@@ -1608,6 +2145,7 @@ def main() -> int:
                 "--execute-next is deprecated; execution is now the default.",
                 file=sys.stderr,
             )
+        ensure_local_git_exclude(verbose=args.verbose)
         plan_files = prepare_plan_file(original_plan_file, args.copy_to_run_dir)
         raw_state = load_json_state(plan_files.plan_file)
         plan_files = with_plan_state_context(plan_files, raw_state)
@@ -1620,6 +2158,13 @@ def main() -> int:
     if args.run_all:
         try:
             plan_files = with_execution_run_dir(plan_files, plan_state.plan_id)
+            if args.review_after_pass and not args.commit_after_pass:
+                print(
+                    "Warning: review diff is cumulative because commits are disabled. "
+                    "The reviewer will use per-pass diff snapshots, but pass isolation "
+                    "is stronger with --commit-after-pass.",
+                    file=sys.stderr,
+                )
             if args.commit_after_pass:
                 require_clean_worktree_for_commits()
             return run_all(
@@ -1628,6 +2173,7 @@ def main() -> int:
                 include_parents=args.include_parents,
                 codex_bin=args.codex_bin,
                 verbose=args.verbose,
+                review_after_pass=args.review_after_pass,
                 commit_after_pass=args.commit_after_pass,
                 commit_prefix=args.commit_prefix,
             )
@@ -1675,6 +2221,26 @@ def main() -> int:
             codex_bin=args.codex_bin,
         )
         plan_state_after = load_plan_state_from_file(plan_files.plan_file)
+        if args.review_after_pass:
+            if (
+                result.codex_returncode == 0
+                and harness_checks_passed(result)
+                and selected_item_status_after(plan_state_after, result.selected_before)
+                in DONE_STATUSES
+            ):
+                result = run_review_after_pass(
+                    plan_files,
+                    result,
+                    plan_state_after,
+                    codex_bin=args.codex_bin,
+                )
+            else:
+                reason = "pass not review-eligible"
+                if result.codex_returncode != 0:
+                    reason = "Codex failed"
+                elif not harness_checks_passed(result):
+                    reason = "harness failed"
+                result = replace(result, review=ReviewResult.not_attempted(reason))
         result = apply_commit_if_eligible(
             plan_files,
             result,
