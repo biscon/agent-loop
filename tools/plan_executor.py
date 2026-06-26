@@ -641,11 +641,14 @@ def load_tui_plan_state(plan_path: str) -> TuiPlanLoadState:
     return TuiPlanLoadState(input_path=input_path, view=view)
 
 
-def build_tui_command_preview(plan_path: str, options: TuiOptions) -> str:
-    argv = ["python3", "tools/plan_executor.py"]
-    if plan_path:
-        argv.append(plan_path)
+def build_tui_option_argv(options: TuiOptions, *, include_run_all: bool = True) -> list[str]:
+    argv: list[str] = []
     if options.run_all:
+        if not include_run_all:
+            raise PlanError(
+                "Run all is not implemented in the TUI yet. "
+                "Uncheck Run all to run one pass."
+            )
         argv.append("--run-all")
         argv.extend(["--max-passes", str(options.max_passes)])
     if options.review_after_pass:
@@ -664,7 +667,30 @@ def build_tui_command_preview(plan_path: str, options: TuiOptions) -> str:
         argv.append("--inhibit-sleep")
     if options.codex_bin != "codex":
         argv.extend(["--codex-bin", options.codex_bin])
+    return argv
+
+
+def build_tui_command_preview(plan_path: str, options: TuiOptions) -> str:
+    argv = ["python3", "tools/plan_executor.py"]
+    if plan_path:
+        argv.append(plan_path)
+    argv.extend(build_tui_option_argv(options))
     return shlex.join(argv)
+
+
+def build_tui_subprocess_argv(
+    plan_path: str,
+    options: TuiOptions,
+    *,
+    python_executable: str = sys.executable,
+    runner_path: Path | None = None,
+) -> list[str]:
+    runner = runner_path or Path(__file__).resolve()
+    argv = [python_executable, str(runner)]
+    if plan_path:
+        argv.append(plan_path)
+    argv.extend(build_tui_option_argv(options, include_run_all=False))
+    return argv
 
 
 def find_docs_markdown_plans(root: Path = Path(".")) -> list[Path]:

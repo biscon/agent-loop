@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
 
 from textual import on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -97,6 +99,65 @@ class PlanBrowseDialog(ModalScreen[Path | None]):
         self.dismiss(None)
 
 
+class QuitAfterRunDialog(ModalScreen[bool]):
+    """Confirm quitting after the active pass finishes."""
+
+    CSS = """
+    QuitAfterRunDialog {
+        align: center middle;
+    }
+
+    #quit-after-run-dialog {
+        width: 54;
+        height: 11;
+        border: round $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #quit-after-run-title {
+        height: 1;
+        text-style: bold;
+    }
+
+    #quit-after-run-message {
+        height: 2;
+        margin: 1 0;
+    }
+
+    #quit-after-run-actions {
+        height: 3;
+        align-horizontal: right;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quit-after-run-dialog"):
+            yield Static("Run in progress", id="quit-after-run-title")
+            yield Static(
+                "Wait for the current pass before quitting.",
+                id="quit-after-run-message",
+            )
+            with Horizontal(id="quit-after-run-actions"):
+                yield Button("Cancel", id="quit-cancel", compact=True)
+                yield Button("Quit after current pass", id="quit-after-run", compact=True)
+
+    @on(Button.Pressed, "#quit-cancel")
+    def cancel_pressed(self) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#quit-after-run")
+    def quit_after_run_pressed(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 def render_recent_log_lines(lines: list[str], visible_count: int = 3) -> str:
     """Render the newest log lines in chronological order."""
     if visible_count <= 0:
@@ -145,6 +206,11 @@ class PlanExecutorTui(App[None]):
 
     #browse {
         min-width: 10;
+        margin: 0 1 0 0;
+    }
+
+    #run-pass-button {
+        min-width: 12;
         margin: 0;
     }
 
@@ -240,9 +306,10 @@ class PlanExecutorTui(App[None]):
     """
 
     BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("ctrl+c", "quit", "Quit"),
-        ("escape", "blur_input", "Blur input"),
+        Binding("q", "safe_quit", "Quit", priority=True),
+        Binding("ctrl+c", "safe_quit", "Quit", priority=True),
+        Binding("r", "run_pass", "Run pass"),
+        Binding("escape", "blur_input", "Blur input"),
     ]
 
     def __init__(self, initial_plan_path: str | None = None) -> None:
@@ -251,6 +318,12 @@ class PlanExecutorTui(App[None]):
         self.plan_path_text = self.initial_plan_path
         self.loaded_view: plan_executor.PlanStatusView | None = None
         self.log_lines: list[str] = []
+        self.run_in_progress = False
+        self.run_process: asyncio.subprocess.Process | None = None
+        self.quit_after_run = False
+        self.safe_quit_dialog_open = False
+        self.current_run_selected_id: str | None = None
+        self.current_run_started_at: datetime | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -265,6 +338,7 @@ class PlanExecutorTui(App[None]):
                 )
                 yield Button("Load", id="load", variant="primary", compact=True)
                 yield Button("Browse", id="browse", compact=True)
+                yield Button("Run Pass", id="run-pass-button", compact=True)
             yield Static(
                 "Paste paths using your terminal paste shortcut, usually Ctrl+Shift+V.",
                 id="paste-hint",
@@ -345,7 +419,7 @@ class PlanExecutorTui(App[None]):
                     classes="medium-input option-secondary-control",
                     compact=True,
                 )
-            yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
+            yield Label("Idle", id="run-status")
         # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
         yield Static("", id="command-preview")
         log_widget = Static("", id="log")
@@ -356,23 +430,37 @@ class PlanExecutorTui(App[None]):
     def on_mount(self) -> None:
         self.append_log("TUI started.")
         self.update_command_preview()
+        self.update_control_state()
         if self.initial_plan_path:
             if self.load_plan(self.initial_plan_path):
                 self.clear_entry_focus()
 
     @on(Button.Pressed, "#load")
     def load_button_pressed(self) -> None:
+        if self.run_in_progress:
+            self.append_log("Cannot load while a run is in progress.")
+            return
         self.load_plan(self.plan_path_text)
 
     @on(Button.Pressed, "#browse")
     def browse_button_pressed(self) -> None:
+        if self.run_in_progress:
+            self.append_log("Cannot browse while a run is in progress.")
+            return
         self.push_screen(
             PlanBrowseDialog(plan_executor.find_docs_markdown_plans()),
             self.browse_finished,
         )
 
+    @on(Button.Pressed, "#run-pass-button")
+    def run_pass_button_pressed(self) -> None:
+        self.action_run_pass()
+
     @on(Input.Submitted, "#plan-path")
     def plan_path_submitted(self, event: Input.Submitted) -> None:
+        if self.run_in_progress:
+            self.append_log("Cannot load while a run is in progress.")
+            return
         if self.load_plan(event.value):
             self.clear_entry_focus()
 
@@ -399,17 +487,73 @@ class PlanExecutorTui(App[None]):
             focused.blur()
             self.set_focus(None)
 
+    def request_safe_quit(self) -> None:
+        if not self.run_in_progress:
+            self.exit()
+            return
+        if self.safe_quit_dialog_open:
+            return
+        self.safe_quit_dialog_open = True
+        self.push_screen(QuitAfterRunDialog(), self.quit_after_run_finished)
+
+    def action_safe_quit(self) -> None:
+        self.request_safe_quit()
+
+    def action_quit(self) -> None:
+        self.request_safe_quit()
+
+    def action_help_quit(self) -> None:
+        self.request_safe_quit()
+
+    def action_run_pass(self) -> None:
+        if self.run_in_progress:
+            self.append_log("Run already in progress.")
+            return
+        if self.loaded_view is None or self.loaded_view.selected is None:
+            self.append_log("Cannot run: no valid plan loaded.")
+            return
+        options = self.current_options()
+        if options.run_all:
+            self.append_log(
+                "Run all is not implemented in the TUI yet. "
+                "Uncheck Run all to run one pass."
+            )
+            return
+
+        selected_id = self.loaded_view.selected.id
+        plan_path = self.plan_path_text
+        self.run_in_progress = True
+        self.quit_after_run = False
+        self.current_run_selected_id = selected_id
+        self.current_run_started_at = datetime.now()
+        self.update_run_status(f"Running {selected_id}")
+        self.update_control_state()
+        self.run_worker(
+            self.run_selected_pass(plan_path, selected_id, options),
+            name="run-pass",
+            exclusive=True,
+        )
+
     def browse_finished(self, selected_path: Path | None) -> None:
+        if self.run_in_progress:
+            self.append_log("Cannot browse while a run is in progress.")
+            return
         if selected_path is None:
             return
         if self.load_plan(str(selected_path)):
             self.clear_entry_focus()
 
+    def quit_after_run_finished(self, should_quit: bool) -> None:
+        self.safe_quit_dialog_open = False
+        if should_quit:
+            self.quit_after_run = True
+            self.append_log("Will quit after current pass finishes.")
+
     def clear_entry_focus(self) -> None:
         self.query_one("#plan-path", Input).blur()
         self.set_focus(None)
 
-    def load_plan(self, plan_path: str | None = None) -> bool:
+    def load_plan(self, plan_path: str | None = None, *, log_load: bool = True) -> bool:
         if plan_path is None:
             plan_path = self.plan_path_text
         plan_text = plan_path.strip()
@@ -417,15 +561,19 @@ class PlanExecutorTui(App[None]):
         path_input = self.query_one("#plan-path", Input)
         if path_input.value != plan_text:
             path_input.value = plan_text
-        self.append_log(f"Attempting to load plan: {plan_text}")
+        if log_load:
+            self.append_log(f"Attempting to load plan: {plan_text}")
         state = plan_executor.load_tui_plan_state(plan_text)
         if state.view is None:
             error = state.load_error or "unknown error"
             log_error = error.removeprefix(f"{plan_text}: ")
             self.loaded_view = None
             self.render_invalid_plan(error)
-            self.append_log(f"Failed to load plan: {plan_text}: {log_error}")
+            if log_load:
+                self.append_log(f"Failed to load plan: {plan_text}: {log_error}")
             self.update_command_preview()
+            if not self.quit_after_run:
+                self.update_control_state()
             self.query_one("#plan-path", Input).focus()
             return False
 
@@ -440,13 +588,16 @@ class PlanExecutorTui(App[None]):
         self.render_progress(view)
         self.render_selection(view)
         selected_id = view.selected.id if view.selected is not None else None
-        if selected_id is None:
-            self.append_log("Plan complete.")
-        else:
-            self.append_log(f"Loaded plan. Selected {selected_id}.")
-        if previous_selected is not None and previous_selected != selected_id:
+        if log_load:
+            if selected_id is None:
+                self.append_log("Plan complete.")
+            else:
+                self.append_log(f"Loaded plan. Selected {selected_id}.")
+        if log_load and previous_selected is not None and previous_selected != selected_id:
             self.append_log(f"Selected item changed after reload: {previous_selected} -> {selected_id}.")
         self.update_command_preview()
+        if not self.quit_after_run:
+            self.update_control_state()
         return True
 
     def render_progress(self, view: plan_executor.PlanStatusView) -> None:
@@ -494,6 +645,121 @@ class PlanExecutorTui(App[None]):
         options = self.current_options()
         preview = plan_executor.build_tui_command_preview(self.plan_path_text, options)
         self.query_one("#command-preview", Static).update(f"Command preview:\n{preview}")
+
+    def update_run_status(self, message: str) -> None:
+        self.query_one("#run-status", Label).update(message)
+
+    def update_control_state(self) -> None:
+        has_selected_item = (
+            self.loaded_view is not None and self.loaded_view.selected is not None
+        )
+        controls_disabled = self.run_in_progress
+        for selector, widget_type in [
+            ("#plan-path", Input),
+            ("#load", Button),
+            ("#browse", Button),
+            ("#run-all", Checkbox),
+            ("#max-passes", Input),
+            ("#review-after-pass", Checkbox),
+            ("#fix-after-review", Checkbox),
+            ("#commit-after-pass", Checkbox),
+            ("#commit-prefix", Input),
+            ("#copy-to-run-dir", Checkbox),
+            ("#run-dir", Input),
+            ("#inhibit-sleep", Checkbox),
+            ("#codex-bin", Input),
+        ]:
+            self.query_one(selector, widget_type).disabled = controls_disabled
+        self.query_one("#run-pass-button", Button).disabled = (
+            controls_disabled or not has_selected_item
+        )
+
+    async def drain_subprocess_stream(
+        self, stream: asyncio.StreamReader | None
+    ) -> int:
+        if stream is None:
+            return 0
+        line_count = 0
+        while True:
+            line = await stream.readline()
+            if not line:
+                return line_count
+            line_count += 1
+
+    async def run_selected_pass(
+        self,
+        plan_path: str,
+        selected_id: str,
+        options: plan_executor.TuiOptions,
+    ) -> None:
+        return_code: int | None = None
+        failed = False
+        self.append_log(f"Starting pass {selected_id}.")
+        try:
+            argv = plan_executor.build_tui_subprocess_argv(plan_path, options)
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self.run_process = process
+            stdout_task = asyncio.create_task(
+                self.drain_subprocess_stream(process.stdout)
+            )
+            stderr_task = asyncio.create_task(
+                self.drain_subprocess_stream(process.stderr)
+            )
+            return_code = await process.wait()
+            await asyncio.gather(stdout_task, stderr_task)
+            if return_code == 0:
+                self.update_run_status(f"Finished with return code {return_code}")
+            else:
+                self.update_run_status(f"Failed with return code {return_code}")
+            self.append_log(f"Runner exited with return code {return_code}.")
+        except Exception as exc:
+            failed = True
+            if return_code is None:
+                self.update_run_status("Failed")
+            else:
+                self.update_run_status(f"Failed with return code {return_code}")
+            self.append_log(f"Run failed: {exc}")
+        finally:
+            self.run_in_progress = False
+            self.run_process = None
+            self.current_run_selected_id = None
+            self.current_run_started_at = None
+            try:
+                if self.load_plan(plan_path, log_load=False):
+                    reloaded_id = (
+                        self.loaded_view.selected.id
+                        if self.loaded_view is not None and self.loaded_view.selected is not None
+                        else None
+                    )
+                    if reloaded_id is None:
+                        self.append_log("Reloaded plan. No selected item.")
+                    else:
+                        self.append_log(f"Reloaded plan. Selected {reloaded_id}.")
+                else:
+                    self.append_log("Reload failed after run.")
+            except Exception as exc:
+                failed = True
+                self.append_log(f"Reload failed after run: {exc}")
+                self.loaded_view = None
+                self.render_invalid_plan(str(exc))
+                self.update_command_preview()
+            if failed:
+                self.append_log("Run failed.")
+            if failed and return_code is None:
+                self.update_run_status("Failed")
+            elif return_code is None and not failed:
+                self.update_run_status("Idle")
+            if self.quit_after_run:
+                self.exit()
+            else:
+                if self.safe_quit_dialog_open:
+                    self.safe_quit_dialog_open = False
+                    self.pop_screen()
+                self.update_control_state()
 
     def current_options(self) -> plan_executor.TuiOptions:
         max_passes_text = self.query_one("#max-passes", Input).value.strip()

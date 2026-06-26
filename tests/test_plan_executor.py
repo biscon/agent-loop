@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -18,11 +19,25 @@ INVALID_TUI_PLAN = "docs/runner_compatible_plans.md"
 
 def import_tui_or_skip():
     try:
-        from textual.widgets import Input, Static
-        from tools.plan_executor_tui import PlanExecutorTui, render_recent_log_lines
+        from textual.widgets import Button, Checkbox, Input, Static
+        from tools import plan_executor_tui
+        from tools.plan_executor_tui import (
+            PlanExecutorTui,
+            QuitAfterRunDialog,
+            render_recent_log_lines,
+        )
     except ImportError as exc:
         raise unittest.SkipTest("Textual is not available") from exc
-    return PlanExecutorTui, Input, Static, render_recent_log_lines
+    return (
+        plan_executor_tui,
+        PlanExecutorTui,
+        QuitAfterRunDialog,
+        Button,
+        Checkbox,
+        Input,
+        Static,
+        render_recent_log_lines,
+    )
 
 
 def plan_markdown(state: dict, opener: str = "```plan-state-json") -> str:
@@ -90,7 +105,11 @@ def env_with_fake_git(tmp: Path) -> dict[str, str]:
 class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         (
+            self.plan_executor_tui,
             self.PlanExecutorTui,
+            self.QuitAfterRunDialog,
+            self.Button,
+            self.Checkbox,
             self.Input,
             self.Static,
             self.render_recent_log_lines,
@@ -112,6 +131,25 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     async def click_load(self, pilot) -> None:
         await pilot.click("#load")
         await pilot.pause()
+
+    def run_pass_button_disabled(self, app) -> bool:
+        return bool(app.query_one("#run-pass-button", self.Button).disabled)
+
+    def fake_stream(self, text: str = ""):
+        reader = asyncio.StreamReader()
+        if text:
+            reader.feed_data(text.encode("utf-8"))
+        reader.feed_eof()
+        return reader
+
+    class FakeProcess:
+        def __init__(self, returncode: int, stdout, stderr) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+        async def wait(self) -> int:
+            return self.returncode
 
     def assert_invalid_plan_visible(self, app) -> None:
         self.assertIn("No valid plan loaded.", self.panel_text(app, "#progress"))
@@ -135,6 +173,247 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
     def test_log_helper_handles_non_positive_visible_count(self) -> None:
         self.assertEqual(self.render_recent_log_lines(["line 1"], visible_count=0), "")
+
+    async def test_tui_run_pass_disabled_before_valid_plan_load(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            self.assertTrue(self.run_pass_button_disabled(app))
+
+    async def test_tui_run_pass_enabled_after_valid_plan_load(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+
+            self.assertFalse(self.run_pass_button_disabled(app))
+
+    async def test_tui_run_key_without_valid_plan_logs_clear_message(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.action_run_pass()
+            await pilot.pause()
+
+            self.assertIn("Cannot run: no valid plan loaded.", self.log_text(app))
+
+    async def test_tui_run_pass_rejects_run_all_option(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+            app.query_one("#run-all", self.Checkbox).value = True
+            await pilot.pause()
+
+            app.action_run_pass()
+            await pilot.pause()
+
+            self.assertFalse(app.run_in_progress)
+            self.assertIn(
+                "Run all is not implemented in the TUI yet. Uncheck Run all to run one pass.",
+                self.log_text(app),
+            )
+
+    async def test_tui_subprocess_creation_failure_restores_controls(self) -> None:
+        async def fail_create_subprocess_exec(*args, **kwargs):
+            raise OSError("fake subprocess failure")
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fail_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                self.assertFalse(app.run_in_progress)
+                self.assertIsNone(app.run_process)
+                self.assertFalse(self.run_pass_button_disabled(app))
+                self.assertTrue(
+                    any(
+                        "Run failed: fake subprocess failure" in line
+                        for line in app.log_lines
+                    )
+                )
+                self.assertIn("Run failed.", self.log_text(app))
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_run_lifecycle_messages_remain_visible_after_reload(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return self.FakeProcess(
+                42,
+                self.fake_stream("fake stdout\n"),
+                self.fake_stream("fake stderr\n"),
+            )
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                log_lines = "\n".join(app.log_lines)
+                self.assertIn("Starting pass phase_01.", log_lines)
+                self.assertIn("Runner exited with return code 42.", log_lines)
+                self.assertIn("Reloaded plan. Selected phase_01.", log_lines)
+
+                rendered_log = self.log_text(app)
+                self.assertIn("Starting pass phase_01.", rendered_log)
+                self.assertIn("Runner exited with return code 42.", rendered_log)
+                self.assertIn("Reloaded plan. Selected phase_01.", rendered_log)
+                self.assertNotIn("fake stdout", rendered_log)
+                self.assertNotIn("fake stderr", rendered_log)
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_safe_quit_modal_does_not_stack(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            app.set_focus(None)
+            await pilot.press("q")
+            await pilot.pause()
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+
+            dialogs = [
+                screen
+                for screen in app.screen_stack
+                if isinstance(screen, self.QuitAfterRunDialog)
+            ]
+            self.assertEqual(len(dialogs), 1)
+
+            app.quit_after_run_finished(False)
+            await pilot.pause()
+
+            self.assertFalse(app.quit_after_run)
+            self.assertFalse(app.safe_quit_dialog_open)
+
+    async def test_tui_builtin_quit_actions_use_safe_quit_modal(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+
+            app.action_quit()
+            await pilot.pause()
+            app.action_help_quit()
+            await pilot.pause()
+
+            dialogs = [
+                screen
+                for screen in app.screen_stack
+                if isinstance(screen, self.QuitAfterRunDialog)
+            ]
+            self.assertEqual(len(dialogs), 1)
+            self.assertTrue(app.safe_quit_dialog_open)
+
+    async def test_tui_safe_quit_modal_contains_expected_actions(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            app.action_safe_quit()
+            await pilot.pause()
+
+            dialog = app.screen_stack[-1]
+            self.assertIsInstance(dialog, self.QuitAfterRunDialog)
+            cancel_button = dialog.query_one("#quit-cancel", self.Button)
+            quit_button = dialog.query_one("#quit-after-run", self.Button)
+
+            self.assertEqual(str(cancel_button.label), "Cancel")
+            self.assertEqual(str(quit_button.label), "Quit after current pass")
+
+    async def test_tui_ctrl_c_opens_safe_quit_modal_while_input_focused(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            app.query_one("#codex-bin", self.Input).focus()
+
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+
+            self.assertTrue(app.safe_quit_dialog_open)
+            self.assertTrue(
+                any(
+                    isinstance(screen, self.QuitAfterRunDialog)
+                    for screen in app.screen_stack
+                )
+            )
+
+    async def test_tui_safe_quit_modal_can_quit_after_current_pass(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            app.action_safe_quit()
+            await pilot.pause()
+
+            app.quit_after_run_finished(True)
+            await pilot.pause()
+
+            self.assertTrue(app.quit_after_run)
+            self.assertFalse(app.safe_quit_dialog_open)
+
+    async def test_tui_safe_quit_modal_dismisses_when_run_finishes(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return self.FakeProcess(42, self.fake_stream(), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.run_in_progress = True
+                app.safe_quit_dialog_open = True
+                app.push_screen(self.QuitAfterRunDialog(), app.quit_after_run_finished)
+                await pilot.pause()
+
+                await app.run_selected_pass(
+                    VALID_TUI_PLAN,
+                    "phase_01",
+                    app.current_options(),
+                )
+                await pilot.pause()
+
+                self.assertFalse(app.safe_quit_dialog_open)
+                self.assertFalse(app.quit_after_run)
+                self.assertFalse(
+                    any(
+                        isinstance(screen, self.QuitAfterRunDialog)
+                        for screen in app.screen_stack
+                    )
+                )
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_priority_q_binding_does_not_block_text_input(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            codex_input = app.query_one("#codex-bin", self.Input)
+            codex_input.value = ""
+            codex_input.focus()
+
+            await pilot.press("q")
+            await pilot.pause()
+
+            self.assertEqual(codex_input.value, "q")
+            self.assertFalse(app.safe_quit_dialog_open)
 
     async def test_tui_load_button_uses_current_visible_path_after_valid_then_invalid(self) -> None:
         app = self.PlanExecutorTui()
@@ -619,6 +898,56 @@ class PlanExecutorTests(unittest.TestCase):
             preview,
             "python3 tools/plan_executor.py docs/my_plan.md --run-all --max-passes 3 --review-after-pass",
         )
+
+    def test_tui_subprocess_argv_for_one_pass_options(self) -> None:
+        argv = plan_executor.build_tui_subprocess_argv(
+            "docs/my_plan.md",
+            plan_executor.TuiOptions(
+                review_after_pass=True,
+                fix_after_review=True,
+                commit_after_pass=True,
+                commit_prefix="work",
+                copy_to_run_dir=True,
+                run_dir=".agent-runs/test",
+                inhibit_sleep=True,
+                codex_bin="fake-codex",
+            ),
+            python_executable="/usr/bin/python",
+            runner_path=Path("/repo/tools/plan_executor.py"),
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                "/usr/bin/python",
+                "/repo/tools/plan_executor.py",
+                "docs/my_plan.md",
+                "--review-after-pass",
+                "--fix-after-review",
+                "--commit-after-pass",
+                "--commit-prefix",
+                "work",
+                "--copy-to-run-dir",
+                ".agent-runs/test",
+                "--inhibit-sleep",
+                "--codex-bin",
+                "fake-codex",
+            ],
+        )
+        self.assertNotIn("--tui", argv)
+        self.assertNotIn("--run-all", argv)
+
+    def test_tui_subprocess_argv_rejects_run_all(self) -> None:
+        with self.assertRaisesRegex(
+            plan_executor.PlanError,
+            "Run all is not implemented in the TUI yet",
+        ):
+            plan_executor.build_tui_subprocess_argv(
+                "docs/my_plan.md",
+                plan_executor.TuiOptions(run_all=True),
+                python_executable="/usr/bin/python",
+                runner_path=Path("/repo/tools/plan_executor.py"),
+            )
 
     def test_find_docs_markdown_plans_returns_sorted_recursive_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
