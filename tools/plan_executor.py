@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,16 @@ PLAN_COPY_NAME = "plan.md"
 WORKSPACE_DIR_NAME = "workspace"
 SANDBOX_DIR_NAME = "agent_loop_sandbox"
 LOGS_DIR_NAME = "logs"
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 class PlanError(Exception):
@@ -123,6 +134,72 @@ class ExecutionResult:
     harness_checks: list[HarnessCheck]
     prompt: str
     same_selection_warning: str | None = None
+    commit: "CommitResult | None" = None
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    requested: bool
+    attempted: bool = False
+    created: bool = False
+    hash: str | None = None
+    subject: str | None = None
+    skipped_reason: str | None = None
+    returncode: int | None = None
+    cached_diff_stat_path: Path | None = None
+    cached_name_status_path: Path | None = None
+
+    @classmethod
+    def not_requested(cls) -> "CommitResult":
+        return cls(requested=False)
+
+    def to_json_obj(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"commit_requested": self.requested}
+        if not self.requested:
+            return data
+        data.update(
+            {
+                "commit_attempted": self.attempted,
+                "commit_created": self.created,
+                "commit_hash": self.hash,
+                "commit_subject": self.subject,
+                "commit_skipped_reason": self.skipped_reason,
+            }
+        )
+        if self.returncode is not None:
+            data["commit_returncode"] = self.returncode
+        if self.cached_diff_stat_path is not None:
+            data["commit_cached_diff_stat"] = str(self.cached_diff_stat_path)
+        if self.cached_name_status_path is not None:
+            data["commit_cached_name_status"] = str(self.cached_name_status_path)
+        return data
+
+
+@dataclass
+class RunAllRecord:
+    selected_id: str
+    selected_title: str
+    status: str
+    logs_dir: str | None = None
+    codex_returncode: int | None = None
+    selected_after_id: str | None = None
+    selected_after_title: str | None = None
+    selected_item_post_status: str | None = None
+    commit: CommitResult | None = None
+
+    def to_json_obj(self) -> dict[str, Any]:
+        data = {
+            "selected_id": self.selected_id,
+            "selected_title": self.selected_title,
+            "status": self.status,
+            "logs_dir": self.logs_dir,
+            "codex_returncode": self.codex_returncode,
+            "selected_after_id": self.selected_after_id,
+            "selected_after_title": self.selected_after_title,
+            "selected_item_post_status": self.selected_item_post_status,
+        }
+        data.update((self.commit or CommitResult.not_requested()).to_json_obj())
+        return data
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,12 +235,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-all",
         action="store_true",
-        help="Reserved for future multi-pass execution.",
+        help="Run one Codex process per unfinished item until complete or stopped.",
+    )
+    parser.add_argument(
+        "--max-passes",
+        type=positive_int,
+        default=10,
+        help="Maximum number of passes for --run-all. Defaults to 10.",
     )
     parser.add_argument(
         "--codex-bin",
         default="codex",
         help="Codex executable to use for execution. Defaults to codex.",
+    )
+    parser.add_argument(
+        "--commit-after-pass",
+        action="store_true",
+        help="Commit git changes after each successful executed pass.",
+    )
+    parser.add_argument(
+        "--commit-prefix",
+        default="plan",
+        help="Prefix for automated commit subjects. Defaults to plan.",
     )
     parser.add_argument(
         "--dry-run-prompt",
@@ -660,18 +753,333 @@ def run_harness_checks() -> list[HarnessCheck]:
     return checks
 
 
+def run_git_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, text=True)
+
+
+def require_clean_worktree_for_commits() -> None:
+    completed = run_git_command(["git", "status", "--porcelain"])
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise PlanError(f"failed to inspect git worktree before commit: {detail}")
+    if completed.stdout.strip():
+        raise PlanError(
+            "Cannot use --commit-after-pass with a dirty worktree.\n"
+            "Commit, stash, or clean existing changes first."
+        )
+    print("Commit preflight: git worktree is clean.")
+
+
+def selected_item_status_after(
+    plan_state_after: PlanState,
+    selected_before: Selection,
+) -> str | None:
+    if selected_before.item is None:
+        return None
+    item = plan_state_after.items_by_id.get(selected_before.item.id)
+    return item.status if item is not None else None
+
+
+def commit_subject(prefix: str, selected_item: PlanItem) -> str:
+    return f"{prefix}: complete {selected_item.id} - {selected_item.title}"
+
+
+def commit_body(
+    plan_file: Path,
+    selected_item: PlanItem,
+    status_after: str,
+    logs_dir: Path,
+) -> str:
+    return "\n".join(
+        [
+            "Automated plan executor pass.",
+            "",
+            f"Plan: {plan_file}",
+            f"Selected item: {selected_item.id} - {selected_item.title}",
+            f"Status after: {status_after}",
+            f"Logs: {logs_dir}",
+        ]
+    )
+
+
+def write_command_output(path: Path, text: str) -> None:
+    write_text_file(path, text)
+
+
+def attempt_git_commit(
+    plan_files: PlanFiles,
+    result: ExecutionResult,
+    plan_state_after: PlanState,
+    commit_prefix: str,
+) -> CommitResult:
+    if result.selected_before.item is None:
+        return CommitResult(
+            requested=True,
+            skipped_reason="no selected item",
+        )
+
+    selected_item = result.selected_before.item
+    status_after = selected_item_status_after(plan_state_after, result.selected_before)
+    subject = commit_subject(commit_prefix, selected_item)
+    logs_dir = result.logs_dir
+    for log_name in (
+        "git_commit_status_before.txt",
+        "git_commit_add_stdout.txt",
+        "git_commit_add_stderr.txt",
+        "git_commit_status_after_add.txt",
+        "git_commit_cached_diff_stat.txt",
+        "git_commit_cached_name_status.txt",
+        "git_commit_stdout.txt",
+        "git_commit_stderr.txt",
+        "git_commit_returncode.txt",
+    ):
+        write_command_output(logs_dir / log_name, "")
+
+    status_before = run_git_command(["git", "status", "--porcelain"])
+    write_command_output(logs_dir / "git_commit_status_before.txt", status_before.stdout)
+    if status_before.returncode != 0:
+        write_command_output(
+            logs_dir / "git_commit_stderr.txt",
+            status_before.stderr,
+        )
+        write_command_output(
+            logs_dir / "git_commit_returncode.txt",
+            f"{status_before.returncode}\n",
+        )
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git status failed before commit",
+            returncode=status_before.returncode,
+        )
+
+    add = run_git_command(["git", "add", "-A"])
+    write_command_output(logs_dir / "git_commit_add_stdout.txt", add.stdout)
+    write_command_output(logs_dir / "git_commit_add_stderr.txt", add.stderr)
+    if add.returncode != 0:
+        write_command_output(logs_dir / "git_commit_returncode.txt", f"{add.returncode}\n")
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git add failed",
+            returncode=add.returncode,
+        )
+
+    status_after_add = run_git_command(["git", "status", "--porcelain"])
+    write_command_output(
+        logs_dir / "git_commit_status_after_add.txt",
+        status_after_add.stdout,
+    )
+    if status_after_add.returncode != 0:
+        write_command_output(
+            logs_dir / "git_commit_stderr.txt",
+            status_after_add.stderr,
+        )
+        write_command_output(
+            logs_dir / "git_commit_returncode.txt",
+            f"{status_after_add.returncode}\n",
+        )
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git status failed after add",
+            returncode=status_after_add.returncode,
+        )
+
+    cached_quiet = run_git_command(["git", "diff", "--cached", "--quiet"])
+    if cached_quiet.returncode == 0:
+        write_command_output(logs_dir / "git_commit_returncode.txt", "0\n")
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason=f"No git changes to commit for {selected_item.id}.",
+            returncode=0,
+        )
+    if cached_quiet.returncode != 1:
+        write_command_output(
+            logs_dir / "git_commit_stderr.txt",
+            cached_quiet.stderr,
+        )
+        write_command_output(
+            logs_dir / "git_commit_returncode.txt",
+            f"{cached_quiet.returncode}\n",
+        )
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git diff --cached --quiet failed",
+            returncode=cached_quiet.returncode,
+        )
+
+    cached_stat = run_git_command(["git", "diff", "--cached", "--stat"])
+    cached_stat_path = logs_dir / "git_commit_cached_diff_stat.txt"
+    write_command_output(cached_stat_path, cached_stat.stdout)
+    cached_name_status = run_git_command(["git", "diff", "--cached", "--name-status"])
+    cached_name_status_path = logs_dir / "git_commit_cached_name_status.txt"
+    write_command_output(cached_name_status_path, cached_name_status.stdout)
+
+    if cached_stat.stdout:
+        print("Staged diff stat:")
+        print(cached_stat.stdout.rstrip())
+    if cached_name_status.stdout:
+        print("Staged name-status:")
+        print(cached_name_status.stdout.rstrip())
+    print(f"Staged name-status log: {cached_name_status_path}")
+
+    if cached_stat.returncode != 0:
+        write_command_output(logs_dir / "git_commit_returncode.txt", f"{cached_stat.returncode}\n")
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git diff --cached --stat failed",
+            returncode=cached_stat.returncode,
+            cached_diff_stat_path=cached_stat_path,
+            cached_name_status_path=cached_name_status_path,
+        )
+    if cached_name_status.returncode != 0:
+        write_command_output(
+            logs_dir / "git_commit_returncode.txt",
+            f"{cached_name_status.returncode}\n",
+        )
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git diff --cached --name-status failed",
+            returncode=cached_name_status.returncode,
+            cached_diff_stat_path=cached_stat_path,
+            cached_name_status_path=cached_name_status_path,
+        )
+
+    body = commit_body(
+        plan_files.plan_file,
+        selected_item,
+        status_after or "",
+        logs_dir,
+    )
+    commit = run_git_command(["git", "commit", "-m", subject, "-m", body])
+    write_command_output(logs_dir / "git_commit_stdout.txt", commit.stdout)
+    write_command_output(logs_dir / "git_commit_stderr.txt", commit.stderr)
+    write_command_output(logs_dir / "git_commit_returncode.txt", f"{commit.returncode}\n")
+    if commit.returncode != 0:
+        return CommitResult(
+            requested=True,
+            attempted=True,
+            subject=subject,
+            skipped_reason="git commit failed",
+            returncode=commit.returncode,
+            cached_diff_stat_path=cached_stat_path,
+            cached_name_status_path=cached_name_status_path,
+        )
+
+    rev_parse = run_git_command(["git", "rev-parse", "HEAD"])
+    commit_hash = rev_parse.stdout.strip() if rev_parse.returncode == 0 else None
+    return CommitResult(
+        requested=True,
+        attempted=True,
+        created=True,
+        hash=commit_hash,
+        subject=subject,
+        returncode=0,
+        cached_diff_stat_path=cached_stat_path,
+        cached_name_status_path=cached_name_status_path,
+    )
+
+
+def commit_result_failed(commit: CommitResult | None) -> bool:
+    return commit is not None and commit.returncode not in (None, 0)
+
+
+def commit_not_eligible(reason: str) -> CommitResult:
+    return CommitResult(
+        requested=True,
+        attempted=False,
+        skipped_reason=reason,
+    )
+
+
+def apply_commit_if_eligible(
+    plan_files: PlanFiles,
+    result: ExecutionResult,
+    plan_state_after: PlanState,
+    commit_requested: bool,
+    commit_prefix: str,
+) -> ExecutionResult:
+    if not commit_requested:
+        return replace(result, commit=CommitResult.not_requested())
+
+    if result.codex_returncode != 0:
+        return replace(result, commit=commit_not_eligible("Codex failed"))
+
+    if not harness_checks_passed(result):
+        return replace(result, commit=commit_not_eligible("harness failed"))
+
+    status_after = selected_item_status_after(plan_state_after, result.selected_before)
+    if status_after not in DONE_STATUSES:
+        return replace(result, commit=commit_not_eligible("selected item not completed"))
+
+    commit = attempt_git_commit(plan_files, result, plan_state_after, commit_prefix)
+    return replace(result, commit=commit)
+
+
+def stream_pipe(pipe: Any, prefix: str, sink: Any, collected: list[str]) -> None:
+    for line in pipe:
+        collected.append(line)
+        print(f"{prefix}{line}", end="", file=sink)
+
+
+def run_codex_exec(codex_bin: str, prompt: str) -> tuple[int, str, str]:
+    try:
+        process = subprocess.Popen(
+            [codex_bin, "exec", prompt],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError:
+        raise
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_thread = threading.Thread(
+        target=stream_pipe,
+        args=(process.stdout, "[codex] ", sys.stdout, stdout_lines),
+    )
+    stderr_thread = threading.Thread(
+        target=stream_pipe,
+        args=(process.stderr, "[codex:stderr] ", sys.stderr, stderr_lines),
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    returncode = process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    return returncode, "".join(stdout_lines), "".join(stderr_lines)
+
+
 def execute_next(
     plan_files: PlanFiles,
     selected_before: Selection,
     include_parents: bool,
     codex_bin: str,
+    logs_dir: Path | None = None,
 ) -> ExecutionResult:
     if selected_before.item is None:
         raise PlanError("cannot execute next item because the plan is complete")
     if plan_files.run_dir is None:
         raise PlanError("execution requires a run directory")
 
-    logs_dir = per_pass_logs_dir(plan_files.run_dir, selected_before.item.id)
+    if logs_dir is None:
+        logs_dir = per_pass_logs_dir(plan_files.run_dir, selected_before.item.id)
     try:
         logs_dir.mkdir(parents=True, exist_ok=False)
     except OSError as exc:
@@ -686,19 +1094,15 @@ def execute_next(
     write_json_file(logs_dir / "selection_before.json", selection_to_json_obj(selected_before))
 
     try:
-        completed = subprocess.run(
-            [codex_bin, "exec", prompt],
-            capture_output=True,
-            text=True,
-        )
+        codex_returncode, codex_stdout, codex_stderr = run_codex_exec(codex_bin, prompt)
     except OSError as exc:
         write_text_file(logs_dir / "codex_error.txt", str(exc) + "\n")
         copy_plan_backup(plan_files.plan_file, plan_backup_after)
         raise PlanError(f"failed to run {codex_bin!r}: {exc}") from exc
 
-    write_text_file(logs_dir / "codex_stdout.txt", completed.stdout)
-    write_text_file(logs_dir / "codex_stderr.txt", completed.stderr)
-    write_text_file(logs_dir / "codex_returncode.txt", f"{completed.returncode}\n")
+    write_text_file(logs_dir / "codex_stdout.txt", codex_stdout)
+    write_text_file(logs_dir / "codex_stderr.txt", codex_stderr)
+    write_text_file(logs_dir / "codex_returncode.txt", f"{codex_returncode}\n")
     copy_plan_backup(plan_files.plan_file, plan_backup_after)
 
     plan_state_after = load_plan_state_from_file(plan_files.plan_file)
@@ -724,7 +1128,7 @@ def execute_next(
     return ExecutionResult(
         selected_before=selected_before,
         selected_after=selected_after,
-        codex_returncode=completed.returncode,
+        codex_returncode=codex_returncode,
         logs_dir=logs_dir,
         plan_backup_before=plan_backup_before,
         plan_backup_after=plan_backup_after,
@@ -816,6 +1220,26 @@ def print_harness_checks(harness_checks: list[HarnessCheck]) -> None:
             print(check.stderr.rstrip(), file=sys.stderr)
 
 
+def print_commit_result(commit: CommitResult | None) -> None:
+    commit = commit or CommitResult.not_requested()
+    print("Git commit:")
+    print(f"Requested: {commit.requested}")
+    if not commit.requested:
+        return
+    print(f"Attempted: {commit.attempted}")
+    if commit.subject is not None:
+        print(f"Subject: {commit.subject}")
+    if commit.created:
+        print("Created: True")
+        print(f"Commit hash: {commit.hash}")
+    else:
+        print("Created: False")
+    if commit.skipped_reason is not None:
+        print(f"Skipped reason: {commit.skipped_reason}")
+    if commit.cached_name_status_path is not None:
+        print(f"Staged name-status log: {commit.cached_name_status_path}")
+
+
 def print_execution_output(
     plan_files: PlanFiles,
     plan_state_before: PlanState,
@@ -842,6 +1266,8 @@ def print_execution_output(
         print(f"Warning: {result.same_selection_warning}")
     print()
     print_harness_checks(result.harness_checks)
+    print()
+    print_commit_result(result.commit)
 
 
 def build_json_output(
@@ -900,16 +1326,270 @@ def build_execution_json_output(
     output["plan_backup_before"] = str(result.plan_backup_before)
     output["plan_backup_after"] = str(result.plan_backup_after)
     output["harness_checks"] = [check.to_json_obj() for check in result.harness_checks]
+    output.update((result.commit or CommitResult.not_requested()).to_json_obj())
     if result.same_selection_warning is not None:
         output["warning"] = result.same_selection_warning
     return output
 
 
 def command_exit_code(result: ExecutionResult) -> int:
+    if commit_result_failed(result.commit):
+        return result.commit.returncode or 1
     for check in result.harness_checks:
         if check.returncode != 0:
             return check.returncode
     return result.codex_returncode
+
+
+def harness_checks_passed(result: ExecutionResult) -> bool:
+    return all(check.returncode == 0 for check in result.harness_checks)
+
+
+def item_json(selection: Selection) -> dict[str, str] | None:
+    return selection.item.to_json_obj() if selection.item is not None else None
+
+
+def write_run_all_summary(run_dir: Path, records: list[RunAllRecord], stop_reason: str) -> None:
+    summary = {
+        "stop_reason": stop_reason,
+        "passes": [record.to_json_obj() for record in records],
+    }
+    write_json_file(run_dir / "run_all_summary.json", summary)
+    lines = ["Run-all summary:"]
+    for record in records:
+        commit = record.commit or CommitResult.not_requested()
+        line = f"- {record.selected_id}: {record.status}"
+        if commit.requested:
+            if commit.created:
+                line += f" commit={commit.hash}"
+            elif commit.skipped_reason:
+                line += f" commit_skipped={commit.skipped_reason}"
+        lines.append(line)
+    lines.append(f"Stopped: {stop_reason}")
+    write_text_file(run_dir / "run_all_summary.txt", "\n".join(lines) + "\n")
+
+
+def print_run_all_summary(records: list[RunAllRecord], stop_reason: str) -> None:
+    print("Run-all summary:")
+    for record in records:
+        commit = record.commit or CommitResult.not_requested()
+        line = f"- {record.selected_id}: {record.status}"
+        if commit.requested:
+            if commit.created:
+                line += f" commit={commit.hash}"
+            elif commit.skipped_reason:
+                line += f" commit_skipped={commit.skipped_reason}"
+        print(line)
+    print(f"Stopped: {stop_reason}")
+
+
+def print_run_all_banner(
+    pass_number: int,
+    max_passes: int,
+    selection: Selection,
+    plan_file: Path,
+    logs_dir: Path,
+) -> None:
+    print("=" * 80)
+    print(f"Run-all pass {pass_number}/{max_passes}")
+    if selection.item is not None:
+        print(f"Selected: {selection.item.id} - {selection.item.title}")
+    print(f"Active plan: {plan_file}")
+    print(f"Logs: {logs_dir}")
+    print("=" * 80)
+
+
+def children_count(plan_state: PlanState, item_id: str) -> int:
+    return len(plan_state.children_by_parent.get(item_id, []))
+
+
+def classify_run_all_result(
+    selected_before: Selection,
+    plan_state_before: PlanState,
+    selected_after: Selection,
+    plan_state_after: PlanState,
+) -> tuple[str, str]:
+    if selected_before.item is None:
+        return "parse_failed", "parse failed"
+
+    selected_after_item = plan_state_after.items_by_id.get(selected_before.item.id)
+    if selected_after_item is None:
+        return "selected_item_not_completed", "selected item not completed"
+
+    if selected_after_item.status in DONE_STATUSES:
+        return "passed", ""
+
+    before_children = children_count(plan_state_before, selected_before.item.id)
+    after_children = children_count(plan_state_after, selected_before.item.id)
+    if after_children > before_children:
+        return "plan_expanded_needs_review", "plan expanded needs review"
+
+    if selected_after_item.status in {"Blocked", "Partial", "Planned", "In Progress"}:
+        return "selected_item_not_completed", "selected item not completed"
+
+    if (
+        selected_after.item is not None
+        and selected_after.item.id == selected_before.item.id
+    ):
+        return "no_progress", "no progress"
+
+    return "selected_item_not_completed", "selected item not completed"
+
+
+def run_all(
+    plan_files: PlanFiles,
+    max_passes: int,
+    include_parents: bool,
+    codex_bin: str,
+    verbose: bool,
+    commit_after_pass: bool,
+    commit_prefix: str,
+) -> int:
+    records: list[RunAllRecord] = []
+
+    for pass_number in range(1, max_passes + 1):
+        try:
+            plan_state_before = load_plan_state_from_file(plan_files.plan_file)
+        except PlanError:
+            stop_reason = "parse failed"
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print_run_all_summary(records, stop_reason)
+            raise
+
+        selection_before = select_next_item(plan_state_before, include_parents=include_parents)
+        if selection_before.item is None:
+            stop_reason = "plan complete"
+            print("Plan complete: no unfinished items remain.")
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print_run_all_summary(records, stop_reason)
+            return 0
+
+        logs_dir = per_pass_logs_dir(plan_files.run_dir, selection_before.item.id)
+        print_run_all_banner(
+            pass_number,
+            max_passes,
+            selection_before,
+            plan_files.plan_file,
+            logs_dir,
+        )
+
+        try:
+            result = execute_next(
+                plan_files,
+                selection_before,
+                include_parents=include_parents,
+                codex_bin=codex_bin,
+                logs_dir=logs_dir,
+            )
+            plan_state_after = load_plan_state_from_file(plan_files.plan_file)
+        except PlanError:
+            record = RunAllRecord(
+                selected_id=selection_before.item.id,
+                selected_title=selection_before.item.title,
+                status="parse_failed",
+                logs_dir=str(logs_dir),
+                commit=commit_not_eligible("parse failed") if commit_after_pass else None,
+            )
+            records.append(record)
+            stop_reason = "parse failed"
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print_run_all_summary(records, stop_reason)
+            raise
+
+        selected_after_item = item_json(result.selected_after)
+        record = RunAllRecord(
+            selected_id=selection_before.item.id,
+            selected_title=selection_before.item.title,
+            status="passed",
+            logs_dir=str(result.logs_dir),
+            codex_returncode=result.codex_returncode,
+            selected_after_id=selected_after_item["id"] if selected_after_item else None,
+            selected_after_title=selected_after_item["title"] if selected_after_item else None,
+            selected_item_post_status=plan_state_after.items_by_id.get(
+                selection_before.item.id,
+                selection_before.item,
+            ).status,
+            commit=CommitResult.not_requested(),
+        )
+        if commit_after_pass:
+            record.commit = commit_not_eligible("pass not commit-eligible")
+
+        if result.codex_returncode != 0:
+            record.status = "codex_failed"
+            if commit_after_pass:
+                record.commit = commit_not_eligible("Codex failed")
+            records.append(record)
+            stop_reason = "Codex failed"
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print(f"Codex failed with return code {result.codex_returncode}.")
+            print_run_all_summary(records, stop_reason)
+            return result.codex_returncode or 1
+
+        if not harness_checks_passed(result):
+            record.status = "harness_failed"
+            if commit_after_pass:
+                record.commit = commit_not_eligible("harness failed")
+            records.append(record)
+            stop_reason = "harness failed"
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print("Harness checks failed.")
+            print_run_all_summary(records, stop_reason)
+            return 1
+
+        record.status, stop_reason = classify_run_all_result(
+            selection_before,
+            plan_state_before,
+            result.selected_after,
+            plan_state_after,
+        )
+
+        if record.status != "passed":
+            if commit_after_pass:
+                record.commit = commit_not_eligible(stop_reason)
+            records.append(record)
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print(f"Run-all stopped: {stop_reason}.")
+            print_run_all_summary(records, stop_reason)
+            return 1
+
+        result = apply_commit_if_eligible(
+            plan_files,
+            result,
+            plan_state_after,
+            commit_requested=commit_after_pass,
+            commit_prefix=commit_prefix,
+        )
+        record.commit = result.commit
+        if commit_result_failed(result.commit):
+            record.status = "commit_failed"
+            records.append(record)
+            stop_reason = "commit failed"
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print_commit_result(result.commit)
+            print_run_all_summary(records, stop_reason)
+            return result.commit.returncode or 1
+        records.append(record)
+
+        next_text = "plan complete"
+        if result.selected_after.item is not None:
+            next_text = f"{result.selected_after.item.id} - {result.selected_after.item.title}"
+        print(f"Completed pass: {selection_before.item.id}")
+        print(f"Codex return code: {result.codex_returncode}")
+        print(f"Next selected: {next_text}")
+        print("Harness checks: passed")
+        print_commit_result(result.commit)
+
+        if result.selected_after.item is None:
+            stop_reason = "plan complete"
+            write_run_all_summary(plan_files.run_dir, records, stop_reason)
+            print_run_all_summary(records, stop_reason)
+            return 0
+
+    stop_reason = "max passes"
+    write_run_all_summary(plan_files.run_dir, records, stop_reason)
+    print("Max-pass limit reached before plan completion.")
+    print_run_all_summary(records, stop_reason)
+    return 1
 
 
 def main() -> int:
@@ -917,8 +1597,12 @@ def main() -> int:
     original_plan_file = Path(args.plan_file)
 
     try:
-        if args.run_all:
-            raise PlanError("--run-all is not implemented yet.")
+        if args.run_all and args.status:
+            raise PlanError("--run-all cannot be used with --status")
+        if args.run_all and args.dry_run_prompt:
+            raise PlanError("--run-all cannot be used with --dry-run-prompt")
+        if args.run_all and args.json:
+            raise PlanError("--run-all --json is not implemented yet.")
         if args.execute_next:
             print(
                 "--execute-next is deprecated; execution is now the default.",
@@ -932,6 +1616,24 @@ def main() -> int:
     except PlanError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+    if args.run_all:
+        try:
+            plan_files = with_execution_run_dir(plan_files, plan_state.plan_id)
+            if args.commit_after_pass:
+                require_clean_worktree_for_commits()
+            return run_all(
+                plan_files,
+                max_passes=args.max_passes,
+                include_parents=args.include_parents,
+                codex_bin=args.codex_bin,
+                verbose=args.verbose,
+                commit_after_pass=args.commit_after_pass,
+                commit_prefix=args.commit_prefix,
+            )
+        except PlanError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.status or selection.item is None:
         if args.json:
@@ -964,6 +1666,8 @@ def main() -> int:
 
     try:
         plan_files = with_execution_run_dir(plan_files, plan_state.plan_id)
+        if args.commit_after_pass:
+            require_clean_worktree_for_commits()
         result = execute_next(
             plan_files,
             selection,
@@ -971,6 +1675,13 @@ def main() -> int:
             codex_bin=args.codex_bin,
         )
         plan_state_after = load_plan_state_from_file(plan_files.plan_file)
+        result = apply_commit_if_eligible(
+            plan_files,
+            result,
+            plan_state_after,
+            commit_requested=args.commit_after_pass,
+            commit_prefix=args.commit_prefix,
+        )
     except PlanError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
