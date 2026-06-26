@@ -432,6 +432,42 @@ class PlanExecutorTests(unittest.TestCase):
             "python3 tools/plan_executor.py docs/my_plan.md --run-all --max-passes 3 --review-after-pass",
         )
 
+    def test_find_docs_markdown_plans_returns_sorted_recursive_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs/nested").mkdir(parents=True)
+            (root / "docs/zeta.md").write_text("# Zeta\n", encoding="utf-8")
+            (root / "docs/alpha.md").write_text("# Alpha\n", encoding="utf-8")
+            (root / "docs/nested/beta.md").write_text("# Beta\n", encoding="utf-8")
+            (root / "docs/nested/ignore.txt").write_text("ignore\n", encoding="utf-8")
+            (root / "outside.md").write_text("# Outside\n", encoding="utf-8")
+
+            plans = plan_executor.find_docs_markdown_plans(root)
+
+        self.assertEqual(
+            plans,
+            [
+                Path("docs/alpha.md"),
+                Path("docs/nested/beta.md"),
+                Path("docs/zeta.md"),
+            ],
+        )
+
+    def test_find_docs_markdown_plans_handles_missing_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = plan_executor.find_docs_markdown_plans(Path(tmp))
+
+        self.assertEqual(plans, [])
+
+    def test_find_docs_markdown_plans_handles_empty_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+
+            plans = plan_executor.find_docs_markdown_plans(root)
+
+        self.assertEqual(plans, [])
+
     def test_normal_cli_status_path_works_without_textual(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             plan_file = Path(tmp) / "plan.md"

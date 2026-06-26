@@ -46,6 +46,10 @@ Open the optional Textual TUI for status inspection and option setup:
 python3 tools/plan_executor.py --tui
 ```
 
+The TUI is read-only in V3.0: it loads plans, previews commands, and lets you
+adjust options, but it does not execute Codex. Paste paths using your terminal
+paste shortcut, usually Ctrl+Shift+V.
+
 Textual is optional for normal CLI use. These commands work without installing
 Textual:
 

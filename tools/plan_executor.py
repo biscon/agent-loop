@@ -645,6 +645,13 @@ def build_tui_command_preview(plan_path: str, options: TuiOptions) -> str:
     return shlex.join(argv)
 
 
+def find_docs_markdown_plans(root: Path = Path(".")) -> list[Path]:
+    docs_dir = root / "docs"
+    if not docs_dir.is_dir():
+        return []
+    return sorted(path.relative_to(root) for path in docs_dir.glob("**/*.md") if path.is_file())
+
+
 def selection_to_json_obj(selection: Selection) -> dict[str, Any]:
     output: dict[str, Any] = {
         "selected": selection.item.to_json_obj() if selection.item is not None else None,

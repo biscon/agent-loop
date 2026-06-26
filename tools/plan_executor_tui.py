@@ -8,12 +8,93 @@ from pathlib import Path
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Static
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Static,
+)
 
 try:
     from tools import plan_executor
 except ImportError:
     import plan_executor  # type: ignore[no-redef]
+
+
+class PlanBrowseDialog(ModalScreen[Path | None]):
+    """Small keyboard-friendly picker for Markdown plans under docs/."""
+
+    CSS = """
+    PlanBrowseDialog {
+        align: center middle;
+    }
+
+    #browse-dialog {
+        width: 70%;
+        height: 70%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #browse-title {
+        height: 1;
+        text-style: bold;
+    }
+
+    #browse-list {
+        height: 1fr;
+        margin: 1 0;
+    }
+
+    #browse-empty {
+        height: 1fr;
+        margin: 1 0;
+    }
+
+    #browse-actions {
+        height: 3;
+        align-horizontal: right;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Close"),
+    ]
+
+    def __init__(self, paths: list[Path]) -> None:
+        super().__init__()
+        self.paths = paths
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="browse-dialog"):
+            yield Static("Browse Markdown plans in docs/", id="browse-title")
+            if self.paths:
+                yield ListView(
+                    *[ListItem(Label(str(path))) for path in self.paths],
+                    id="browse-list",
+                )
+            else:
+                yield Static("No Markdown files found under docs/.", id="browse-empty")
+            with Horizontal(id="browse-actions"):
+                yield Button("Cancel", id="browse-cancel")
+
+    @on(ListView.Selected, "#browse-list")
+    def plan_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(self.paths[event.index])
+
+    @on(Button.Pressed, "#browse-cancel")
+    def cancel_pressed(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class PlanExecutorTui(App[None]):
@@ -25,12 +106,29 @@ class PlanExecutorTui(App[None]):
     }
 
     #top {
-        height: 3;
+        height: 5;
         padding: 0 1;
+    }
+
+    #path-row {
+        height: 3;
+    }
+
+    #paste-hint {
+        height: 1;
+        color: $text-muted;
     }
 
     #plan-path {
         width: 1fr;
+    }
+
+    #load {
+        min-width: 8;
+    }
+
+    #browse {
+        min-width: 10;
     }
 
     #main {
@@ -50,33 +148,50 @@ class PlanExecutorTui(App[None]):
     }
 
     #options {
-        height: 10;
+        height: 16;
         border: round $accent;
-        padding: 0 1;
+        padding: 1 2;
     }
 
     #log {
-        height: 7;
+        height: 6;
         border: round $accent;
         padding: 0 1;
     }
 
     .option-row {
-        height: 1;
+        height: 2;
+    }
+
+    .option-group {
+        width: 18;
+        text-style: bold;
+    }
+
+    .option-label {
+        width: 16;
     }
 
     .short-input {
-        width: 16;
+        width: 12;
     }
 
     .medium-input {
         width: 28;
+    }
+
+    #command-preview {
+        height: 4;
+        border: round $accent;
+        padding: 0 1;
+        margin-top: 1;
     }
     """
 
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
+        ("escape", "blur_input", "Blur input"),
     ]
 
     def __init__(self, initial_plan_path: str | None = None) -> None:
@@ -87,36 +202,50 @@ class PlanExecutorTui(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Horizontal(id="top"):
-            yield Label("Plan:")
-            yield Input(
-                value=self.initial_plan_path,
-                placeholder="docs/my_plan.md",
-                id="plan-path",
+        with Vertical(id="top"):
+            with Horizontal(id="path-row"):
+                yield Label("Plan:")
+                yield Input(
+                    value=self.initial_plan_path,
+                    placeholder="docs/my_plan.md",
+                    id="plan-path",
+                )
+                yield Button("Load", id="load", variant="primary")
+                yield Button("Browse", id="browse")
+            yield Static(
+                "Paste paths using your terminal paste shortcut, usually Ctrl+Shift+V.",
+                id="paste-hint",
             )
-            yield Button("Load", id="load", variant="primary")
         with Horizontal(id="main"):
             yield Static("Progress\n\nNo plan loaded.", id="progress")
             yield Static("Current Selection\n\nNo plan loaded.", id="selection")
         with Vertical(id="options"):
             with Horizontal(classes="option-row"):
+                yield Label("Run:", classes="option-group")
                 yield Checkbox("Run all", id="run-all")
-                yield Label("Max passes:")
+                yield Label("Max passes:", classes="option-label")
                 yield Input(value="10", id="max-passes", classes="short-input")
+            with Horizontal(classes="option-row"):
+                yield Label("Quality gates:", classes="option-group")
                 yield Checkbox("Review after pass", id="review-after-pass")
                 yield Checkbox("Fix after review", id="fix-after-review")
             with Horizontal(classes="option-row"):
+                yield Label("Git:", classes="option-group")
                 yield Checkbox("Commit after pass", id="commit-after-pass")
-                yield Label("Commit prefix:")
+                yield Label("Commit prefix:", classes="option-label")
                 yield Input(value="plan", id="commit-prefix", classes="short-input")
+            with Horizontal(classes="option-row"):
+                yield Label("Plan copy:", classes="option-group")
                 yield Checkbox("Copy to run dir", id="copy-to-run-dir")
-                yield Label("Run dir:")
+                yield Label("Run dir:", classes="option-label")
                 yield Input(placeholder=".agent-runs/example", id="run-dir", classes="medium-input")
             with Horizontal(classes="option-row"):
+                yield Label("Runtime:", classes="option-group")
                 yield Checkbox("Inhibit sleep", id="inhibit-sleep")
-                yield Label("Codex bin:")
+                yield Label("Codex bin:", classes="option-label")
                 yield Input(value="codex", id="codex-bin", classes="medium-input")
-                yield Label("Quit: q or Ctrl+C")
+            yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
+            # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
             yield Static("", id="command-preview")
         yield Static("Log\n", id="log")
         yield Footer()
@@ -125,15 +254,24 @@ class PlanExecutorTui(App[None]):
         self.append_log("TUI started.")
         self.update_command_preview()
         if self.initial_plan_path:
-            self.load_plan()
+            if self.load_plan():
+                self.clear_entry_focus()
 
     @on(Button.Pressed, "#load")
     def load_button_pressed(self) -> None:
         self.load_plan()
 
+    @on(Button.Pressed, "#browse")
+    def browse_button_pressed(self) -> None:
+        self.push_screen(
+            PlanBrowseDialog(plan_executor.find_docs_markdown_plans()),
+            self.browse_finished,
+        )
+
     @on(Input.Submitted, "#plan-path")
     def plan_path_submitted(self) -> None:
-        self.load_plan()
+        if self.load_plan():
+            self.clear_entry_focus()
 
     @on(Input.Changed)
     def input_changed(self, event: Input.Changed) -> None:
@@ -150,11 +288,28 @@ class PlanExecutorTui(App[None]):
     def checkbox_changed(self) -> None:
         self.update_command_preview()
 
-    def load_plan(self) -> None:
+    def action_blur_input(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            focused.blur()
+            self.set_focus(None)
+
+    def browse_finished(self, selected_path: Path | None) -> None:
+        if selected_path is None:
+            return
+        self.query_one("#plan-path", Input).value = str(selected_path)
+        if self.load_plan():
+            self.clear_entry_focus()
+
+    def clear_entry_focus(self) -> None:
+        self.query_one("#plan-path", Input).blur()
+        self.set_focus(None)
+
+    def load_plan(self) -> bool:
         plan_text = self.query_one("#plan-path", Input).value.strip()
         if not plan_text:
             self.append_log("Failed to load plan: plan path is empty.")
-            return
+            return False
 
         previous_selected = (
             self.loaded_view.selected.id
@@ -165,7 +320,7 @@ class PlanExecutorTui(App[None]):
             view = plan_executor.build_plan_status_view(Path(plan_text))
         except plan_executor.PlanError as exc:
             self.append_log(f"Failed to load plan: {exc}")
-            return
+            return False
 
         self.loaded_view = view
         self.render_progress(view)
@@ -179,6 +334,7 @@ class PlanExecutorTui(App[None]):
         if previous_selected is not None and previous_selected != selected_id:
             self.append_log(f"Selected item changed after reload: {previous_selected} -> {selected_id}.")
         self.update_command_preview()
+        return True
 
     def render_progress(self, view: plan_executor.PlanStatusView) -> None:
         lines = ["Progress", ""]
