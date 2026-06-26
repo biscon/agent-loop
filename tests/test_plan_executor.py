@@ -21,14 +21,16 @@ INVALID_TUI_PLAN = "docs/runner_compatible_plans.md"
 def import_tui_or_skip():
     try:
         from textual.containers import ScrollableContainer
-        from textual.widgets import Button, Checkbox, Input, Static
+        from textual.widgets import Button, Checkbox, Input, Log, Static
         from tools import plan_executor_tui
         from tools.plan_executor_tui import (
             ActiveRunSnapshot,
             LastRunResult,
             LatestRunMetadata,
+            MAX_RAW_OUTPUT_APPEND_PER_REFRESH,
+            MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES,
             MAX_RAW_OUTPUT_LINES,
-            MAX_RAW_OUTPUT_RENDER_LINES,
+            MAX_RAW_OUTPUT_RENDER_LINE_CHARS,
             PlanExecutorTui,
             QuitAfterRunDialog,
             RAW_OUTPUT_TRUNCATION_TEXT,
@@ -50,8 +52,10 @@ def import_tui_or_skip():
         ActiveRunSnapshot,
         LastRunResult,
         LatestRunMetadata,
+        MAX_RAW_OUTPUT_APPEND_PER_REFRESH,
+        MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES,
         MAX_RAW_OUTPUT_LINES,
-        MAX_RAW_OUTPUT_RENDER_LINES,
+        MAX_RAW_OUTPUT_RENDER_LINE_CHARS,
         PlanExecutorTui,
         QuitAfterRunDialog,
         RAW_OUTPUT_TRUNCATION_TEXT,
@@ -64,6 +68,7 @@ def import_tui_or_skip():
         Button,
         Checkbox,
         Input,
+        Log,
         ScrollableContainer,
         Static,
         render_recent_log_lines,
@@ -146,8 +151,10 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.ActiveRunSnapshot,
             self.LastRunResult,
             self.LatestRunMetadata,
+            self.MAX_RAW_OUTPUT_APPEND_PER_REFRESH,
+            self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES,
             self.MAX_RAW_OUTPUT_LINES,
-            self.MAX_RAW_OUTPUT_RENDER_LINES,
+            self.MAX_RAW_OUTPUT_RENDER_LINE_CHARS,
             self.PlanExecutorTui,
             self.QuitAfterRunDialog,
             self.RAW_OUTPUT_TRUNCATION_TEXT,
@@ -160,6 +167,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.Button,
             self.Checkbox,
             self.Input,
+            self.Log,
             self.ScrollableContainer,
             self.Static,
             self.render_recent_log_lines,
@@ -178,9 +186,19 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         return str(log_widget.content)
 
     def raw_output_text(self, app) -> str:
-        return self.panel_text(app, "#raw-output-details") + "\n" + self.panel_text(
-            app, "#raw-output-text"
+        return self.panel_text(app, "#raw-output-details") + "\n" + "\n".join(
+            app.raw_output_displayed_lines
         )
+
+    def capture_raw_output_widget_writes(self, app) -> None:
+        def captured_write(raw_output_log, lines, *, auto_scroll: bool) -> None:
+            if not lines:
+                return
+            app.raw_output_display_write_count += 1
+            app.raw_output_displayed_lines.extend(lines)
+            app.raw_output_last_displayed_lines = lines
+
+        app.write_raw_output_log_lines = captured_write
 
     def review_text(self, app) -> str:
         return self.panel_text(app, "#review-details") + "\n" + self.panel_text(
@@ -434,6 +452,8 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Failed with return code 42", text)
         self.assertIn("[stdout] fake stdout", text)
         self.assertIn("[stderr] fake stderr", text)
+        self.assertEqual([line.seq for line in state.lines], [1, 2])
+        self.assertEqual(state.next_seq, 3)
 
     def test_raw_output_helper_enforces_limit_with_one_notice(self) -> None:
         state = self.RawOutputState()
@@ -455,7 +475,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("line 2", text)
         self.assertIn("line 4", text)
 
-    def test_raw_output_helper_caps_rendered_tail_without_dropping_buffer(self) -> None:
+    def test_raw_output_helper_caps_displayed_tail_without_dropping_buffer(self) -> None:
         state = self.RawOutputState()
         self.reset_raw_output_state(
             state,
@@ -465,20 +485,23 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             status="Running",
         )
 
-        for index in range(self.MAX_RAW_OUTPUT_RENDER_LINES + 5):
+        for index in range(self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES + 5):
             self.append_raw_output_line(state, "stdout", f"line {index}")
 
         text = self.render_raw_output_state(state)
-        self.assertEqual(len(state.lines), self.MAX_RAW_OUTPUT_RENDER_LINES + 5)
+        self.assertEqual(len(state.lines), self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES + 5)
         self.assertIn(
             "[output view showing latest "
-            f"{self.MAX_RAW_OUTPUT_RENDER_LINES} of "
-            f"{self.MAX_RAW_OUTPUT_RENDER_LINES + 5} retained lines]",
+            f"{self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES} of "
+            f"{self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES + 5} retained lines]",
             text,
         )
         self.assertNotIn("[stdout] line 0", text)
         self.assertIn("[stdout] line 5", text)
-        self.assertIn(f"[stdout] line {self.MAX_RAW_OUTPUT_RENDER_LINES + 4}", text)
+        self.assertIn(
+            f"[stdout] line {self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES + 4}",
+            text,
+        )
 
     def test_raw_output_helper_truncates_only_displayed_long_line(self) -> None:
         state = self.RawOutputState()
@@ -497,6 +520,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.lines[0].text, long_line)
         self.assertIn("[line truncated]", text)
         self.assertNotIn(long_line, text)
+        self.assertLess(len(text), self.MAX_RAW_OUTPUT_RENDER_LINE_CHARS + 500)
 
     def test_raw_output_helper_clear_on_new_run(self) -> None:
         state = self.RawOutputState()
@@ -521,6 +545,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("phase_02 - New title", text)
         self.assertIn("new-command", text)
         self.assertNotIn("old output", text)
+        self.assertEqual(state.next_seq, 1)
 
     def test_review_artifact_selection_no_metadata(self) -> None:
         selection = self.select_latest_review_artifact(None)
@@ -649,7 +674,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("No run output yet.", self.raw_output_text(app))
             self.assertIs(
                 app.focused,
-                app.query_one("#raw-output-scroll", self.ScrollableContainer),
+                app.query_one("#raw-output-log", self.Log),
             )
 
     async def test_tui_f4_shows_review_empty_state(self) -> None:
@@ -822,7 +847,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 self.assertFalse(app.run_in_progress)
@@ -861,7 +886,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 log_lines = "\n".join(app.log_lines)
@@ -922,7 +947,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 self.assertIn("--result-json", captured_args)
@@ -955,7 +980,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 self.assertIsNotNone(app.latest_run_metadata)
@@ -986,12 +1011,13 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 self.assertIsNotNone(app.latest_run_metadata)
                 self.assertIn("failed to parse result metadata", app.latest_run_metadata.load_error)
                 self.assertIsNone(app.latest_run_metadata.logs_dir)
+                self.capture_raw_output_widget_writes(app)
                 await pilot.press("f3")
                 await pilot.pause()
                 self.assertIn("Logs dir: .agent-runs/fake/logs/phase_01", self.raw_output_text(app))
@@ -1020,9 +1046,10 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
+                self.capture_raw_output_widget_writes(app)
                 await pilot.press("f3")
                 await pilot.pause()
 
@@ -1074,10 +1101,12 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
                 app.refresh_raw_output_view = counted_refresh
 
+                self.capture_raw_output_widget_writes(app)
+
                 app.action_run_pass()
                 for _ in range(20):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 captured = "\n".join(line.text for line in app.raw_output_state.lines)
@@ -1086,6 +1115,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("visible stderr 0", captured)
                 self.assertIn(f"visible stderr {emitted_lines - 1}", captured)
                 self.assertLess(refresh_calls, emitted_lines)
+                self.assertLess(app.raw_output_display_write_count, emitted_lines)
 
                 rendered_log = self.log_text(app)
                 self.assertNotIn("visible stdout", rendered_log)
@@ -1094,7 +1124,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
     async def test_tui_hidden_output_defers_render_until_f3(self) -> None:
-        emitted_lines = 120
+        emitted_lines = self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES + 120
 
         async def fake_create_subprocess_exec(*args, **kwargs):
             stdout = "".join(
@@ -1123,22 +1153,36 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(20):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 captured = "\n".join(line.text for line in app.raw_output_state.lines)
                 self.assertIn("hidden stdout 0", captured)
                 self.assertIn(f"hidden stdout {emitted_lines - 1}", captured)
                 self.assertEqual(refresh_calls, 0)
+                self.assertEqual(app.raw_output_display_write_count, 0)
                 self.assertTrue(app.raw_output_dirty)
                 self.assertIn("Finished with return code 0", app.raw_output_state.status)
+
+                self.capture_raw_output_widget_writes(app)
 
                 await pilot.press("f3")
                 await pilot.pause()
 
                 self.assertEqual(refresh_calls, 1)
                 self.assertFalse(app.raw_output_dirty)
+                self.assertEqual(app.raw_output_display_write_count, 1)
+                self.assertIn(
+                    f"latest {self.MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES} of "
+                    f"{emitted_lines} retained lines",
+                    self.raw_output_text(app),
+                )
+                self.assertNotIn("[stdout] hidden stdout 0", self.raw_output_text(app))
                 self.assertIn(f"hidden stdout {emitted_lines - 1}", self.raw_output_text(app))
+                self.assertLess(
+                    len(app.raw_output_displayed_lines),
+                    emitted_lines,
+                )
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
@@ -1158,6 +1202,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.raw_output_dirty)
 
             def successful_refresh(*, auto_scroll: bool = True) -> bool:
+                app.raw_output_display_initialized = True
                 return True
 
             app.refresh_raw_output_view = successful_refresh
@@ -1182,11 +1227,12 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 await self.click_load(pilot)
                 await pilot.press("f3")
                 await pilot.pause()
+                self.capture_raw_output_widget_writes(app)
 
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
 
                 raw_output = self.raw_output_text(app)
@@ -1218,7 +1264,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.action_run_pass()
                 for _ in range(10):
                     await pilot.pause(0.05)
-                    if not app.run_in_progress:
+                    if not app.run_in_progress and app.active_run is None:
                         break
                 self.assertIn("Last run:", self.panel_text(app, "#selection"))
 
@@ -1248,7 +1294,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                     app.action_run_pass()
                     for _ in range(10):
                         await pilot.pause(0.05)
-                        if not app.run_in_progress:
+                        if not app.run_in_progress and app.active_run is None:
                             break
                     self.assertIs(app.elapsed_refresh_timer, timer)
         finally:

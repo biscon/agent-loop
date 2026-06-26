@@ -24,6 +24,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    Log,
     Static,
 )
 
@@ -34,8 +35,10 @@ except ImportError:
 
 
 MAX_RAW_OUTPUT_LINES = 5000
-MAX_RAW_OUTPUT_RENDER_LINES = 1000
-MAX_RAW_OUTPUT_RENDER_LINE_CHARS = 4000
+MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES = 500
+MAX_RAW_OUTPUT_APPEND_PER_REFRESH = 200
+MAX_RAW_OUTPUT_PENDING_RESET_THRESHOLD = 1000
+MAX_RAW_OUTPUT_RENDER_LINE_CHARS = 1000
 RAW_OUTPUT_REFRESH_INTERVAL_SECONDS = 0.15
 RAW_OUTPUT_TRUNCATION_TEXT = "[output truncated: oldest lines dropped]"
 TUI_RESULT_JSON_PATH = plan_executor.DEFAULT_RUNS_DIR / "tui-latest-run-result.json"
@@ -447,6 +450,7 @@ def render_review_details(
 
 @dataclass(frozen=True)
 class RawOutputLine:
+    seq: int
     stream: str
     text: str
 
@@ -458,6 +462,7 @@ class RawOutputState:
     command: str | None = None
     status: str | None = None
     lines: list[RawOutputLine] = field(default_factory=list)
+    next_seq: int = 1
     truncated: bool = False
 
 
@@ -508,6 +513,7 @@ def reset_raw_output_state(
     state.command = command
     state.status = status
     state.lines.clear()
+    state.next_seq = 1
     state.truncated = False
 
 
@@ -522,7 +528,8 @@ def append_raw_output_line(
         state.lines.clear()
         state.truncated = True
         return
-    state.lines.append(RawOutputLine(stream=stream, text=text))
+    state.lines.append(RawOutputLine(seq=state.next_seq, stream=stream, text=text))
+    state.next_seq += 1
     if len(state.lines) > max_lines:
         state.truncated = True
         del state.lines[: len(state.lines) - max_lines]
@@ -566,32 +573,56 @@ def render_raw_output_line(line: RawOutputLine) -> str:
     return f"[{line.stream}] {text}"
 
 
-def render_raw_output_lines(
+def raw_output_tail_notice(displayed_count: int, retained_count: int) -> str:
+    return (
+        "[output view showing latest "
+        f"{displayed_count} of {retained_count} retained lines]"
+    )
+
+
+def raw_output_first_retained_seq(state: RawOutputState) -> int | None:
+    return state.lines[0].seq if state.lines else None
+
+
+def raw_output_newest_retained_seq(state: RawOutputState) -> int | None:
+    return state.lines[-1].seq if state.lines else None
+
+
+def render_raw_output_display_tail(
     state: RawOutputState,
     *,
-    max_render_lines: int = MAX_RAW_OUTPUT_RENDER_LINES,
-) -> str:
+    max_render_lines: int = MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES,
+) -> list[str]:
     if (
         state.selected_id is None
         and state.command is None
         and state.status is None
         and not state.lines
     ):
-        return ""
-    rendered = []
+        return []
+    rendered: list[str] = []
     if state.truncated:
         rendered.append(RAW_OUTPUT_TRUNCATION_TEXT)
     if max_render_lines > 0 and len(state.lines) > max_render_lines:
-        rendered.append(
-            "[output view showing latest "
-            f"{max_render_lines} of {len(state.lines)} retained lines]"
-        )
+        rendered.append(raw_output_tail_notice(max_render_lines, len(state.lines)))
         lines = state.lines[-max_render_lines:]
     else:
         lines = state.lines
     rendered.extend(render_raw_output_line(line) for line in lines)
     if not rendered:
         rendered.append("No output captured yet.")
+    return rendered
+
+
+def render_raw_output_lines(
+    state: RawOutputState,
+    *,
+    max_render_lines: int = MAX_RAW_OUTPUT_DISPLAY_BOOTSTRAP_LINES,
+) -> str:
+    rendered = render_raw_output_display_tail(
+        state,
+        max_render_lines=max_render_lines,
+    )
     return "\n".join(rendered)
 
 
@@ -855,15 +886,11 @@ class PlanExecutorTui(App[None]):
         padding: 0 1;
     }
 
-    #raw-output-scroll {
+    #raw-output-log {
         height: 1fr;
         border: round $accent;
         padding: 0 1;
         margin: 1 0 0 0;
-    }
-
-    #raw-output-text {
-        height: auto;
     }
 
     #review-view {
@@ -920,6 +947,12 @@ class PlanExecutorTui(App[None]):
         self.raw_output_refresh_timer: Any | None = None
         self.raw_output_state = RawOutputState()
         self.raw_output_dirty = False
+        self.raw_output_display_initialized = False
+        self.raw_output_displayed_until_seq: int | None = None
+        self.raw_output_display_write_count = 0
+        self.raw_output_displayed_lines: list[str] = []
+        self.raw_output_last_displayed_lines: list[str] = []
+        self.raw_output_display_has_placeholder = False
         self.active_view = "dashboard"
 
     def compose(self) -> ComposeResult:
@@ -1024,10 +1057,13 @@ class PlanExecutorTui(App[None]):
             yield log_widget
         with Vertical(id="raw-output-view"):
             yield Static("", id="raw-output-details")
-            output_scroll = ScrollableContainer(id="raw-output-scroll", can_focus=True)
-            output_scroll.border_title = "Output"
-            with output_scroll:
-                yield Static("", id="raw-output-text")
+            output_log = Log(
+                highlight=False,
+                auto_scroll=True,
+                id="raw-output-log",
+            )
+            output_log.border_title = "Output"
+            yield output_log
         with Vertical(id="review-view"):
             yield Static("", id="review-details")
             review_scroll = ScrollableContainer(id="review-scroll", can_focus=True)
@@ -1040,7 +1076,6 @@ class PlanExecutorTui(App[None]):
         self.append_log("TUI started.")
         self.query_one("#raw-output-view").display = False
         self.query_one("#review-view").display = False
-        self.refresh_raw_output_view(auto_scroll=False)
         self.refresh_review_view(auto_scroll=False)
         self.elapsed_refresh_timer = self.set_interval(
             1.0, self.refresh_running_selection
@@ -1121,10 +1156,10 @@ class PlanExecutorTui(App[None]):
         self.query_one("#dashboard-view").display = False
         self.query_one("#review-view").display = False
         self.query_one("#raw-output-view").display = True
-        output_scroll = self.query_one("#raw-output-scroll", ScrollableContainer)
-        self.set_focus(output_scroll)
+        output_log = self.query_one("#raw-output-log", Log)
+        self.set_focus(output_log)
         if self.refresh_raw_output_view(auto_scroll=True):
-            self.raw_output_dirty = False
+            self.raw_output_dirty = not self.raw_output_display_is_synchronized()
 
     def action_show_review(self) -> None:
         focused = self.focused
@@ -1323,30 +1358,121 @@ class PlanExecutorTui(App[None]):
     def update_run_status(self, message: str) -> None:
         self.query_one("#run-status", Label).update(message)
 
+    def reset_raw_output_display(self, *, clear_widget: bool = True) -> None:
+        self.raw_output_display_initialized = False
+        self.raw_output_displayed_until_seq = None
+        self.raw_output_displayed_lines = []
+        self.raw_output_last_displayed_lines = []
+        self.raw_output_display_has_placeholder = False
+        if clear_widget:
+            try:
+                self.query_one("#raw-output-log", Log).clear()
+            except Exception:
+                pass
+
+    def raw_output_display_is_synchronized(self) -> bool:
+        newest_seq = raw_output_newest_retained_seq(self.raw_output_state)
+        if newest_seq is None:
+            return self.raw_output_display_initialized
+        return self.raw_output_displayed_until_seq == newest_seq
+
+    def raw_output_pending_lines(self) -> list[RawOutputLine]:
+        displayed_until_seq = self.raw_output_displayed_until_seq
+        if displayed_until_seq is None:
+            return list(self.raw_output_state.lines)
+        return [
+            line
+            for line in self.raw_output_state.lines
+            if line.seq > displayed_until_seq
+        ]
+
+    def raw_output_needs_tail_reset(self, pending_count: int) -> bool:
+        if not self.raw_output_display_initialized:
+            return True
+        if self.raw_output_display_has_placeholder and pending_count > 0:
+            return True
+        first_seq = raw_output_first_retained_seq(self.raw_output_state)
+        if (
+            first_seq is not None
+            and self.raw_output_displayed_until_seq is not None
+            and self.raw_output_displayed_until_seq < first_seq
+        ):
+            return True
+        return pending_count > MAX_RAW_OUTPUT_PENDING_RESET_THRESHOLD
+
+    def write_raw_output_log_lines(
+        self,
+        raw_output_log: Log,
+        lines: list[str],
+        *,
+        auto_scroll: bool,
+    ) -> None:
+        if not lines:
+            return
+        raw_output_log.write_lines(lines, scroll_end=auto_scroll)
+        self.raw_output_display_write_count += 1
+        self.raw_output_displayed_lines.extend(lines)
+        self.raw_output_last_displayed_lines = lines
+
+    def reset_raw_output_log_to_tail(
+        self,
+        raw_output_log: Log,
+        *,
+        auto_scroll: bool,
+    ) -> None:
+        raw_output_log.clear()
+        lines = render_raw_output_display_tail(self.raw_output_state)
+        self.raw_output_displayed_lines = []
+        self.write_raw_output_log_lines(
+            raw_output_log,
+            lines,
+            auto_scroll=auto_scroll,
+        )
+        self.raw_output_display_has_placeholder = (
+            not self.raw_output_state.lines
+            and lines == ["No output captured yet."]
+        )
+        self.raw_output_display_initialized = True
+        self.raw_output_displayed_until_seq = raw_output_newest_retained_seq(
+            self.raw_output_state
+        )
+
     def refresh_raw_output_view(self, *, auto_scroll: bool = True) -> bool:
         try:
             raw_output_details = self.query_one("#raw-output-details", Static)
-            raw_output_text = self.query_one("#raw-output-text", Static)
-            output_scroll = self.query_one("#raw-output-scroll", ScrollableContainer)
+            raw_output_log = self.query_one("#raw-output-log", Log)
         except Exception:
             return False
         raw_output_details.update(render_raw_output_details(self.raw_output_state))
-        raw_output_text.update(render_raw_output_lines(self.raw_output_state))
-        if auto_scroll:
-            output_scroll.scroll_end(animate=False)
+        pending_lines = self.raw_output_pending_lines()
+        if self.raw_output_needs_tail_reset(len(pending_lines)):
+            self.reset_raw_output_log_to_tail(
+                raw_output_log,
+                auto_scroll=auto_scroll,
+            )
+            return True
+        if not pending_lines:
+            return True
+        lines_to_write = pending_lines[:MAX_RAW_OUTPUT_APPEND_PER_REFRESH]
+        self.write_raw_output_log_lines(
+            raw_output_log,
+            [render_raw_output_line(line) for line in lines_to_write],
+            auto_scroll=auto_scroll,
+        )
+        self.raw_output_displayed_until_seq = lines_to_write[-1].seq
         return True
 
     def refresh_dirty_raw_output_view(self) -> None:
         if not self.raw_output_dirty or self.active_view != "output":
             return
         if self.refresh_raw_output_view(auto_scroll=True):
-            self.raw_output_dirty = False
+            self.raw_output_dirty = not self.raw_output_display_is_synchronized()
 
     def refresh_raw_output_if_visible(self, *, auto_scroll: bool = True) -> None:
         if self.active_view != "output":
             return
         if self.refresh_raw_output_view(auto_scroll=auto_scroll):
-            self.raw_output_dirty = False
+            self.raw_output_dirty = not self.raw_output_display_is_synchronized()
 
     def refresh_review_view(self, *, auto_scroll: bool = False) -> None:
         if self.run_in_progress:
@@ -1456,6 +1582,7 @@ class PlanExecutorTui(App[None]):
                 command=shlex.join(argv),
                 status="Running",
             )
+            self.reset_raw_output_display(clear_widget=self.active_view == "output")
             self.raw_output_dirty = True
             self.refresh_raw_output_if_visible(auto_scroll=False)
             try:
