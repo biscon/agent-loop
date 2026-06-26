@@ -22,6 +22,16 @@ from textual.widgets import (
 )
 
 try:
+    from textual.widgets import Log as TextualLog
+except ImportError:
+    TextualLog = None  # type: ignore[assignment]
+
+try:
+    from textual.widgets import RichLog as TextualRichLog
+except ImportError:
+    TextualRichLog = None  # type: ignore[assignment]
+
+try:
     from tools import plan_executor
 except ImportError:
     import plan_executor  # type: ignore[no-redef]
@@ -158,13 +168,13 @@ class PlanExecutorTui(App[None]):
     }
 
     #options {
-        height: 14;
+        height: 13;
         border: round $accent;
         padding: 0 1;
     }
 
     #log {
-        height: 6;
+        height: 4;
         border: round $accent;
         padding: 0 1;
     }
@@ -283,7 +293,23 @@ class PlanExecutorTui(App[None]):
             yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
             # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
             yield Static("", id="command-preview")
-        yield Static("Log\n", id="log")
+        if TextualLog is not None:
+            log_widget = TextualLog(highlight=False, max_lines=200, auto_scroll=True, id="log")
+            log_widget.border_title = "Log"
+            yield log_widget
+        elif TextualRichLog is not None:
+            log_widget = TextualRichLog(
+                max_lines=200,
+                wrap=True,
+                highlight=False,
+                markup=False,
+                auto_scroll=True,
+                id="log",
+            )
+            log_widget.border_title = "Log"
+            yield log_widget
+        else:
+            yield Static("Log\n", id="log")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -350,12 +376,14 @@ class PlanExecutorTui(App[None]):
         path_input = self.query_one("#plan-path", Input)
         if path_input.value != plan_text:
             path_input.value = plan_text
+        self.append_log(f"Attempting to load plan: {plan_text}")
         state = plan_executor.load_tui_plan_state(plan_text)
         if state.view is None:
             error = state.load_error or "unknown error"
+            log_error = error.removeprefix(f"{plan_text}: ")
             self.loaded_view = None
             self.render_invalid_plan(error)
-            self.append_log(f"Failed to load plan: {error}")
+            self.append_log(f"Failed to load plan: {plan_text}: {log_error}")
             self.update_command_preview()
             self.query_one("#plan-path", Input).focus()
             return False
@@ -370,7 +398,6 @@ class PlanExecutorTui(App[None]):
         self.loaded_view = view
         self.render_progress(view)
         self.render_selection(view)
-        self.append_log(f"Loaded plan path: {view.plan_file}")
         selected_id = view.selected.id if view.selected is not None else None
         if selected_id is None:
             self.append_log("Plan complete.")
@@ -449,9 +476,16 @@ class PlanExecutorTui(App[None]):
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
-        self.log_lines.append(f"[{stamp}] {message}")
-        self.log_lines = self.log_lines[-8:]
-        self.query_one("#log", Static).update("Log\n" + "\n".join(self.log_lines))
+        line = f"[{stamp}] {message}"
+        self.log_lines.append(line)
+        self.log_lines = self.log_lines[-200:]
+        log_widget = self.query_one("#log")
+        if TextualLog is not None and isinstance(log_widget, TextualLog):
+            log_widget.write_line(line, scroll_end=True)
+        elif TextualRichLog is not None and isinstance(log_widget, TextualRichLog):
+            log_widget.write(line, scroll_end=True)
+        else:
+            log_widget.update("Log\n" + "\n".join(self.log_lines[-5:]))
 
 
 def run_tui(initial_plan_path: str | None = None) -> int:

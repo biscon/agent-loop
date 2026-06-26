@@ -94,6 +94,12 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     def panel_text(self, app, selector: str) -> str:
         return str(app.query_one(selector, self.Static).content)
 
+    def log_text(self, app) -> str:
+        log_widget = app.query_one("#log")
+        if hasattr(log_widget, "lines"):
+            return "\n".join(str(line) for line in log_widget.lines)
+        return str(log_widget.content)
+
     async def set_plan_path(self, app, pilot, plan_path: str) -> None:
         app.query_one("#plan-path", self.Input).value = plan_path
         await pilot.pause()
@@ -124,6 +130,9 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             await self.click_load(pilot)
 
             self.assert_invalid_plan_visible(app)
+            log_text = self.log_text(app)
+            self.assertIn(f"Attempting to load plan: {INVALID_TUI_PLAN}", log_text)
+            self.assertIn(f"Failed to load plan: {INVALID_TUI_PLAN}:", log_text)
 
     async def test_tui_load_button_recovers_after_invalid_then_valid(self) -> None:
         app = self.PlanExecutorTui()
@@ -140,6 +149,9 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             await self.click_load(pilot)
 
             self.assert_valid_plan_visible(app)
+            log_text = self.log_text(app)
+            self.assertIn(f"Attempting to load plan: {VALID_TUI_PLAN}", log_text)
+            self.assertIn("Loaded plan. Selected phase_01.", log_text)
 
     async def test_tui_browse_invalid_after_valid_clears_stale_state(self) -> None:
         app = self.PlanExecutorTui()
