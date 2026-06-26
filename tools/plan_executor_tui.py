@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import shlex
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,10 @@ try:
     from tools import plan_executor
 except ImportError:
     import plan_executor  # type: ignore[no-redef]
+
+
+MAX_RAW_OUTPUT_LINES = 5000
+RAW_OUTPUT_TRUNCATION_TEXT = "[output truncated: oldest lines dropped]"
 
 
 class PlanBrowseDialog(ModalScreen[Path | None]):
@@ -186,6 +191,22 @@ class LastRunResult:
     reload_error: str | None = None
 
 
+@dataclass(frozen=True)
+class RawOutputLine:
+    stream: str
+    text: str
+
+
+@dataclass
+class RawOutputState:
+    selected_id: str | None = None
+    selected_title: str | None = None
+    command: str | None = None
+    status: str | None = None
+    lines: list[RawOutputLine] = field(default_factory=list)
+    truncated: bool = False
+
+
 def format_elapsed_duration(started_at: datetime, now: datetime) -> str:
     elapsed_seconds = max(0, int((now - started_at).total_seconds()))
     hours, remainder = divmod(elapsed_seconds, 3600)
@@ -218,6 +239,94 @@ def format_run_result(result: LastRunResult) -> str:
     if result.failure_message:
         return f"Failed: {result.failure_message}"
     return "Failed"
+
+
+def reset_raw_output_state(
+    state: RawOutputState,
+    *,
+    selected_id: str,
+    selected_title: str,
+    command: str,
+    status: str,
+) -> None:
+    state.selected_id = selected_id
+    state.selected_title = selected_title
+    state.command = command
+    state.status = status
+    state.lines.clear()
+    state.truncated = False
+
+
+def append_raw_output_line(
+    state: RawOutputState,
+    stream: str,
+    text: str,
+    *,
+    max_lines: int = MAX_RAW_OUTPUT_LINES,
+) -> None:
+    if max_lines <= 0:
+        state.lines.clear()
+        state.truncated = True
+        return
+    state.lines.append(RawOutputLine(stream=stream, text=text))
+    if len(state.lines) > max_lines:
+        state.truncated = True
+        del state.lines[: len(state.lines) - max_lines]
+
+
+def render_raw_output_details(state: RawOutputState) -> str:
+    if (
+        state.selected_id is None
+        and state.command is None
+        and state.status is None
+        and not state.lines
+    ):
+        return "Raw Output\n\nNo run output yet.\nRun a pass to capture stdout/stderr."
+
+    run_text = "Not available"
+    if state.selected_id is not None:
+        if state.selected_title:
+            run_text = f"{state.selected_id} - {state.selected_title}"
+        else:
+            run_text = state.selected_id
+    return "\n".join(
+        [
+            "Raw Output",
+            "",
+            "Run:",
+            f"  {run_text}",
+            "",
+            "Command:",
+            f"  {state.command or 'Not available'}",
+            "",
+            "Status:",
+            f"  {state.status or 'Not available'}",
+        ]
+    )
+
+
+def render_raw_output_lines(state: RawOutputState) -> str:
+    if (
+        state.selected_id is None
+        and state.command is None
+        and state.status is None
+        and not state.lines
+    ):
+        return ""
+    rendered = []
+    if state.truncated:
+        rendered.append(RAW_OUTPUT_TRUNCATION_TEXT)
+    rendered.extend(f"[{line.stream}] {line.text}" for line in state.lines)
+    if not rendered:
+        rendered.append("No output captured yet.")
+    return "\n".join(rendered)
+
+
+def render_raw_output_state(state: RawOutputState) -> str:
+    output = render_raw_output_lines(state)
+    if output:
+        return f"{render_raw_output_details(state)}\n\nOutput:\n{output}"
+    return render_raw_output_details(state)
 
 
 def append_current_selection_lines(
@@ -457,9 +566,37 @@ class PlanExecutorTui(App[None]):
         padding: 0 1;
         margin: 1 0 0 0;
     }
+
+    #dashboard-view {
+        height: 1fr;
+    }
+
+    #raw-output-view {
+        height: 1fr;
+        padding: 0 1;
+    }
+
+    #raw-output-details {
+        height: 10;
+        border: round $accent;
+        padding: 0 1;
+    }
+
+    #raw-output-scroll {
+        height: 1fr;
+        border: round $accent;
+        padding: 0 1;
+        margin: 1 0 0 0;
+    }
+
+    #raw-output-text {
+        height: auto;
+    }
     """
 
     BINDINGS = [
+        Binding("f2", "show_dashboard", "Dashboard"),
+        Binding("f3", "show_output", "Output"),
         Binding("q", "safe_quit", "Quit", priority=True),
         Binding("ctrl+c", "safe_quit", "Quit", priority=True),
         Binding("r", "run_pass", "Run pass"),
@@ -482,111 +619,120 @@ class PlanExecutorTui(App[None]):
         self.last_run_result: LastRunResult | None = None
         self.current_load_error: str | None = None
         self.elapsed_refresh_timer: Any | None = None
+        self.raw_output_state = RawOutputState()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Vertical(id="top"):
-            with Horizontal(id="path-row"):
-                yield Label("Plan:", id="plan-label")
-                yield Input(
-                    value=self.initial_plan_path,
-                    placeholder="docs/my_plan.md",
-                    id="plan-path",
-                    compact=True,
+        with Vertical(id="dashboard-view"):
+            with Vertical(id="top"):
+                with Horizontal(id="path-row"):
+                    yield Label("Plan:", id="plan-label")
+                    yield Input(
+                        value=self.initial_plan_path,
+                        placeholder="docs/my_plan.md",
+                        id="plan-path",
+                        compact=True,
+                    )
+                    yield Button("Load", id="load", variant="primary", compact=True)
+                    yield Button("Browse", id="browse", compact=True)
+                    yield Button("Run Pass", id="run-pass-button", compact=True)
+                yield Static(
+                    "Paste paths using your terminal paste shortcut, usually Ctrl+Shift+V.",
+                    id="paste-hint",
                 )
-                yield Button("Load", id="load", variant="primary", compact=True)
-                yield Button("Browse", id="browse", compact=True)
-                yield Button("Run Pass", id="run-pass-button", compact=True)
-            yield Static(
-                "Paste paths using your terminal paste shortcut, usually Ctrl+Shift+V.",
-                id="paste-hint",
-            )
-        with Horizontal(id="main"):
-            progress_panel = ScrollableContainer(id="progress-panel")
-            progress_panel.border_title = "Progress"
-            with progress_panel:
-                yield Static("No plan loaded.", id="progress")
-            yield Static("Current Selection\n\nNo valid plan loaded.", id="selection")
-        with Vertical(id="options"):
-            with Horizontal(classes="option-row"):
-                yield Label("Run:", classes="option-group")
-                yield Checkbox("Run all", id="run-all", classes="option-primary", compact=True)
-                yield Label("Max passes:", classes="option-secondary-label")
-                yield Input(
-                    value="10",
-                    id="max-passes",
-                    classes="short-input option-secondary-control",
-                    compact=True,
-                )
-            with Horizontal(classes="option-row"):
-                yield Label("Quality gates:", classes="option-group")
-                yield Checkbox(
-                    "Review after pass",
-                    id="review-after-pass",
-                    classes="option-primary",
-                    compact=True,
-                )
-                yield Checkbox(
-                    "Fix after review",
-                    id="fix-after-review",
-                    classes="option-secondary-control",
-                    compact=True,
-                )
-            with Horizontal(classes="option-row"):
-                yield Label("Git:", classes="option-group")
-                yield Checkbox(
-                    "Commit after pass",
-                    id="commit-after-pass",
-                    classes="option-primary",
-                    compact=True,
-                )
-                yield Label("Commit prefix:", classes="option-secondary-label")
-                yield Input(
-                    value="plan",
-                    id="commit-prefix",
-                    classes="short-input option-secondary-control",
-                    compact=True,
-                )
-            with Horizontal(classes="option-row"):
-                yield Label("Plan copy:", classes="option-group")
-                yield Checkbox(
-                    "Copy to run dir",
-                    id="copy-to-run-dir",
-                    classes="option-primary",
-                    compact=True,
-                )
-                yield Label("Run dir:", classes="option-secondary-label")
-                yield Input(
-                    placeholder=".agent-runs/example",
-                    id="run-dir",
-                    classes="medium-input option-secondary-control",
-                    compact=True,
-                )
-            with Horizontal(classes="option-row"):
-                yield Label("Runtime:", classes="option-group")
-                yield Checkbox(
-                    "Inhibit sleep",
-                    id="inhibit-sleep",
-                    classes="option-primary",
-                    compact=True,
-                )
-                yield Label("Codex bin:", classes="option-secondary-label")
-                yield Input(
-                    value="codex",
-                    id="codex-bin",
-                    classes="medium-input option-secondary-control",
-                    compact=True,
-                )
-            yield Label("Idle", id="run-status")
-        # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
-        yield Static("", id="command-preview")
-        log_widget = Static("", id="log")
-        log_widget.border_title = "Log"
-        yield log_widget
+            with Horizontal(id="main"):
+                progress_panel = ScrollableContainer(id="progress-panel")
+                progress_panel.border_title = "Progress"
+                with progress_panel:
+                    yield Static("No plan loaded.", id="progress")
+                yield Static("Current Selection\n\nNo valid plan loaded.", id="selection")
+            with Vertical(id="options"):
+                with Horizontal(classes="option-row"):
+                    yield Label("Run:", classes="option-group")
+                    yield Checkbox("Run all", id="run-all", classes="option-primary", compact=True)
+                    yield Label("Max passes:", classes="option-secondary-label")
+                    yield Input(
+                        value="10",
+                        id="max-passes",
+                        classes="short-input option-secondary-control",
+                        compact=True,
+                    )
+                with Horizontal(classes="option-row"):
+                    yield Label("Quality gates:", classes="option-group")
+                    yield Checkbox(
+                        "Review after pass",
+                        id="review-after-pass",
+                        classes="option-primary",
+                        compact=True,
+                    )
+                    yield Checkbox(
+                        "Fix after review",
+                        id="fix-after-review",
+                        classes="option-secondary-control",
+                        compact=True,
+                    )
+                with Horizontal(classes="option-row"):
+                    yield Label("Git:", classes="option-group")
+                    yield Checkbox(
+                        "Commit after pass",
+                        id="commit-after-pass",
+                        classes="option-primary",
+                        compact=True,
+                    )
+                    yield Label("Commit prefix:", classes="option-secondary-label")
+                    yield Input(
+                        value="plan",
+                        id="commit-prefix",
+                        classes="short-input option-secondary-control",
+                        compact=True,
+                    )
+                with Horizontal(classes="option-row"):
+                    yield Label("Plan copy:", classes="option-group")
+                    yield Checkbox(
+                        "Copy to run dir",
+                        id="copy-to-run-dir",
+                        classes="option-primary",
+                        compact=True,
+                    )
+                    yield Label("Run dir:", classes="option-secondary-label")
+                    yield Input(
+                        placeholder=".agent-runs/example",
+                        id="run-dir",
+                        classes="medium-input option-secondary-control",
+                        compact=True,
+                    )
+                with Horizontal(classes="option-row"):
+                    yield Label("Runtime:", classes="option-group")
+                    yield Checkbox(
+                        "Inhibit sleep",
+                        id="inhibit-sleep",
+                        classes="option-primary",
+                        compact=True,
+                    )
+                    yield Label("Codex bin:", classes="option-secondary-label")
+                    yield Input(
+                        value="codex",
+                        id="codex-bin",
+                        classes="medium-input option-secondary-control",
+                        compact=True,
+                    )
+                yield Label("Idle", id="run-status")
+            yield Static("", id="command-preview")
+            log_widget = Static("", id="log")
+            log_widget.border_title = "Log"
+            yield log_widget
+        with Vertical(id="raw-output-view"):
+            yield Static("", id="raw-output-details")
+            output_scroll = ScrollableContainer(id="raw-output-scroll", can_focus=True)
+            output_scroll.border_title = "Output"
+            with output_scroll:
+                yield Static("", id="raw-output-text")
         yield Footer()
 
     def on_mount(self) -> None:
         self.append_log("TUI started.")
+        self.query_one("#raw-output-view").display = False
+        self.refresh_raw_output_view(auto_scroll=False)
         self.elapsed_refresh_timer = self.set_interval(
             1.0, self.refresh_running_selection
         )
@@ -647,6 +793,21 @@ class PlanExecutorTui(App[None]):
         if isinstance(focused, Input):
             focused.blur()
             self.set_focus(None)
+
+    def action_show_dashboard(self) -> None:
+        self.query_one("#raw-output-view").display = False
+        self.query_one("#dashboard-view").display = True
+        self.set_focus(None)
+
+    def action_show_output(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            focused.blur()
+        self.query_one("#dashboard-view").display = False
+        self.query_one("#raw-output-view").display = True
+        output_scroll = self.query_one("#raw-output-scroll", ScrollableContainer)
+        self.set_focus(output_scroll)
+        self.refresh_raw_output_view(auto_scroll=True)
 
     def request_safe_quit(self) -> None:
         if not self.run_in_progress:
@@ -825,6 +986,25 @@ class PlanExecutorTui(App[None]):
     def update_run_status(self, message: str) -> None:
         self.query_one("#run-status", Label).update(message)
 
+    def refresh_raw_output_view(self, *, auto_scroll: bool = True) -> None:
+        self.query_one("#raw-output-details", Static).update(
+            render_raw_output_details(self.raw_output_state)
+        )
+        self.query_one("#raw-output-text", Static).update(
+            render_raw_output_lines(self.raw_output_state)
+        )
+        if auto_scroll:
+            output_scroll = self.query_one("#raw-output-scroll", ScrollableContainer)
+            output_scroll.scroll_end(animate=False)
+
+    def update_raw_output_status(self, message: str) -> None:
+        self.raw_output_state.status = message
+        self.refresh_raw_output_view(auto_scroll=True)
+
+    def append_raw_output(self, stream: str, text: str) -> None:
+        append_raw_output_line(self.raw_output_state, stream, text)
+        self.refresh_raw_output_view(auto_scroll=True)
+
     def update_control_state(self) -> None:
         has_selected_item = (
             self.loaded_view is not None and self.loaded_view.selected is not None
@@ -851,7 +1031,7 @@ class PlanExecutorTui(App[None]):
         )
 
     async def drain_subprocess_stream(
-        self, stream: asyncio.StreamReader | None
+        self, stream: asyncio.StreamReader | None, stream_name: str
     ) -> int:
         if stream is None:
             return 0
@@ -860,6 +1040,8 @@ class PlanExecutorTui(App[None]):
             line = await stream.readline()
             if not line:
                 return line_count
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            self.append_raw_output(stream_name, text)
             line_count += 1
 
     async def run_selected_pass(
@@ -886,6 +1068,18 @@ class PlanExecutorTui(App[None]):
         self.append_log(f"Starting pass {selected_id}.")
         try:
             argv = plan_executor.build_tui_subprocess_argv(plan_path, options)
+            active_run = self.active_run
+            selected_title = (
+                active_run.selected_title if active_run is not None else selected_id
+            )
+            reset_raw_output_state(
+                self.raw_output_state,
+                selected_id=selected_id,
+                selected_title=selected_title,
+                command=shlex.join(argv),
+                status="Running",
+            )
+            self.refresh_raw_output_view(auto_scroll=False)
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
@@ -893,25 +1087,30 @@ class PlanExecutorTui(App[None]):
             )
             self.run_process = process
             stdout_task = asyncio.create_task(
-                self.drain_subprocess_stream(process.stdout)
+                self.drain_subprocess_stream(process.stdout, "stdout")
             )
             stderr_task = asyncio.create_task(
-                self.drain_subprocess_stream(process.stderr)
+                self.drain_subprocess_stream(process.stderr, "stderr")
             )
             return_code = await process.wait()
             await asyncio.gather(stdout_task, stderr_task)
             if return_code == 0:
                 self.update_run_status(f"Finished with return code {return_code}")
+                self.update_raw_output_status(f"Finished with return code {return_code}")
             else:
                 self.update_run_status(f"Failed with return code {return_code}")
+                self.update_raw_output_status(f"Failed with return code {return_code}")
             self.append_log(f"Runner exited with return code {return_code}.")
         except Exception as exc:
             failed = True
             failure_message = str(exc)
             if return_code is None:
                 self.update_run_status("Failed")
+                self.update_raw_output_status(f"Failed: {failure_message}")
             else:
                 self.update_run_status(f"Failed with return code {return_code}")
+                self.update_raw_output_status(f"Failed with return code {return_code}")
+            self.append_raw_output("runner", f"Failed: {failure_message}")
             self.append_log(f"Run failed: {exc}")
         finally:
             active_run = self.active_run

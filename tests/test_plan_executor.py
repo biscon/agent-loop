@@ -20,16 +20,23 @@ INVALID_TUI_PLAN = "docs/runner_compatible_plans.md"
 
 def import_tui_or_skip():
     try:
+        from textual.containers import ScrollableContainer
         from textual.widgets import Button, Checkbox, Input, Static
         from tools import plan_executor_tui
         from tools.plan_executor_tui import (
             ActiveRunSnapshot,
             LastRunResult,
+            MAX_RAW_OUTPUT_LINES,
             PlanExecutorTui,
             QuitAfterRunDialog,
+            RAW_OUTPUT_TRUNCATION_TEXT,
+            RawOutputState,
+            append_raw_output_line,
             build_selection_panel_text,
             format_elapsed_duration,
+            render_raw_output_state,
             render_recent_log_lines,
+            reset_raw_output_state,
             summarize_tui_options,
         )
     except ImportError as exc:
@@ -38,15 +45,22 @@ def import_tui_or_skip():
         plan_executor_tui,
         ActiveRunSnapshot,
         LastRunResult,
+        MAX_RAW_OUTPUT_LINES,
         PlanExecutorTui,
         QuitAfterRunDialog,
+        RAW_OUTPUT_TRUNCATION_TEXT,
+        RawOutputState,
+        append_raw_output_line,
         build_selection_panel_text,
         format_elapsed_duration,
+        render_raw_output_state,
         Button,
         Checkbox,
         Input,
+        ScrollableContainer,
         Static,
         render_recent_log_lines,
+        reset_raw_output_state,
         summarize_tui_options,
     )
 
@@ -123,15 +137,22 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.plan_executor_tui,
             self.ActiveRunSnapshot,
             self.LastRunResult,
+            self.MAX_RAW_OUTPUT_LINES,
             self.PlanExecutorTui,
             self.QuitAfterRunDialog,
+            self.RAW_OUTPUT_TRUNCATION_TEXT,
+            self.RawOutputState,
+            self.append_raw_output_line,
             self.build_selection_panel_text,
             self.format_elapsed_duration,
+            self.render_raw_output_state,
             self.Button,
             self.Checkbox,
             self.Input,
+            self.ScrollableContainer,
             self.Static,
             self.render_recent_log_lines,
+            self.reset_raw_output_state,
             self.summarize_tui_options,
         ) = import_tui_or_skip()
 
@@ -143,6 +164,11 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         if hasattr(log_widget, "lines"):
             return "\n".join(str(line) for line in log_widget.lines)
         return str(log_widget.content)
+
+    def raw_output_text(self, app) -> str:
+        return self.panel_text(app, "#raw-output-details") + "\n" + self.panel_text(
+            app, "#raw-output-text"
+        )
 
     async def set_plan_path(self, app, pilot, plan_path: str) -> None:
         app.query_one("#plan-path", self.Input).value = plan_path
@@ -351,12 +377,151 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Reload:", text)
         self.assertIn("Load failed: invalid JSON", text)
 
+    def test_raw_output_helper_renders_empty_state_before_run(self) -> None:
+        text = self.render_raw_output_state(self.RawOutputState())
+
+        self.assertIn("No run output yet.", text)
+        self.assertIn("Run a pass to capture stdout/stderr.", text)
+
+    def test_raw_output_helper_renders_running_state(self) -> None:
+        state = self.RawOutputState()
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_01",
+            selected_title="Some title",
+            command="python3 tools/plan_executor.py docs/test.md",
+            status="Running",
+        )
+
+        text = self.render_raw_output_state(state)
+
+        self.assertIn("phase_01 - Some title", text)
+        self.assertIn("python3 tools/plan_executor.py docs/test.md", text)
+        self.assertIn("Running", text)
+
+    def test_raw_output_helper_renders_finished_state_and_lines(self) -> None:
+        state = self.RawOutputState()
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_01",
+            selected_title="Some title",
+            command="fake-command",
+            status="Running",
+        )
+        self.append_raw_output_line(state, "stdout", "fake stdout")
+        self.append_raw_output_line(state, "stderr", "fake stderr")
+        state.status = "Failed with return code 42"
+
+        text = self.render_raw_output_state(state)
+
+        self.assertIn("Failed with return code 42", text)
+        self.assertIn("[stdout] fake stdout", text)
+        self.assertIn("[stderr] fake stderr", text)
+
+    def test_raw_output_helper_enforces_limit_with_one_notice(self) -> None:
+        state = self.RawOutputState()
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_01",
+            selected_title="Some title",
+            command="fake-command",
+            status="Running",
+        )
+
+        for index in range(5):
+            self.append_raw_output_line(state, "stdout", f"line {index}", max_lines=3)
+
+        text = self.render_raw_output_state(state)
+        self.assertEqual(text.count(self.RAW_OUTPUT_TRUNCATION_TEXT), 1)
+        self.assertNotIn("line 0", text)
+        self.assertNotIn("line 1", text)
+        self.assertIn("line 2", text)
+        self.assertIn("line 4", text)
+
+    def test_raw_output_helper_clear_on_new_run(self) -> None:
+        state = self.RawOutputState()
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_01",
+            selected_title="Old title",
+            command="old-command",
+            status="Running",
+        )
+        self.append_raw_output_line(state, "stdout", "old output")
+
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_02",
+            selected_title="New title",
+            command="new-command",
+            status="Running",
+        )
+
+        text = self.render_raw_output_state(state)
+        self.assertIn("phase_02 - New title", text)
+        self.assertIn("new-command", text)
+        self.assertNotIn("old output", text)
+
+    def test_tui_bindings_include_dashboard_and_output_footer_labels(self) -> None:
+        bindings_by_key = {binding.key: binding for binding in self.PlanExecutorTui.BINDINGS}
+
+        self.assertEqual(bindings_by_key["f2"].description, "Dashboard")
+        self.assertEqual(bindings_by_key["f3"].description, "Output")
+
     async def test_tui_run_pass_disabled_before_valid_plan_load(self) -> None:
         app = self.PlanExecutorTui()
         async with app.run_test() as pilot:
             await pilot.pause()
 
             self.assertTrue(self.run_pass_button_disabled(app))
+
+    async def test_tui_f3_shows_raw_output_empty_state(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            self.assertTrue(app.query_one("#dashboard-view").display)
+            self.assertFalse(app.query_one("#raw-output-view").display)
+
+            await pilot.press("f3")
+            await pilot.pause()
+
+            self.assertFalse(app.query_one("#dashboard-view").display)
+            self.assertTrue(app.query_one("#raw-output-view").display)
+            self.assertIn("No run output yet.", self.raw_output_text(app))
+            self.assertIs(
+                app.focused,
+                app.query_one("#raw-output-scroll", self.ScrollableContainer),
+            )
+
+    async def test_tui_f2_returns_to_dashboard_and_clears_hidden_input_focus(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.query_one("#codex-bin", self.Input).focus()
+            await pilot.pause()
+
+            await pilot.press("f3")
+            await pilot.pause()
+
+            self.assertNotIsInstance(app.focused, self.Input)
+
+            await pilot.press("f2")
+            await pilot.pause()
+
+            self.assertTrue(app.query_one("#dashboard-view").display)
+            self.assertFalse(app.query_one("#raw-output-view").display)
+            self.assertIsNone(app.focused)
+
+    async def test_tui_escape_still_blurs_dashboard_inputs(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.query_one("#codex-bin", self.Input).focus()
+            await pilot.pause()
+
+            await pilot.press("escape")
+            await pilot.pause()
+
+            self.assertIsNone(app.focused)
 
     async def test_tui_run_pass_enabled_after_valid_plan_load(self) -> None:
         app = self.PlanExecutorTui()
@@ -467,6 +632,44 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
+    async def test_tui_fake_subprocess_output_appears_only_in_raw_output(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return self.FakeProcess(
+                42,
+                self.fake_stream("fake stdout line\npartial stdout"),
+                self.fake_stream("fake stderr line\npartial stderr"),
+            )
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+                await pilot.press("f3")
+                await pilot.pause()
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                raw_output = self.raw_output_text(app)
+                self.assertIn("phase_01 - Create sandbox and fixed number list", raw_output)
+                self.assertIn("Failed with return code 42", raw_output)
+                self.assertIn("[stdout] fake stdout line", raw_output)
+                self.assertIn("[stdout] partial stdout", raw_output)
+                self.assertIn("[stderr] fake stderr line", raw_output)
+                self.assertIn("[stderr] partial stderr", raw_output)
+
+                rendered_log = self.log_text(app)
+                self.assertNotIn("fake stdout", rendered_log)
+                self.assertNotIn("fake stderr", rendered_log)
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
     async def test_tui_manual_load_clears_last_run_result(self) -> None:
         async def fake_create_subprocess_exec(*args, **kwargs):
             return self.FakeProcess(42, self.fake_stream(), self.fake_stream())
@@ -540,6 +743,24 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(app.quit_after_run)
             self.assertFalse(app.safe_quit_dialog_open)
+
+    async def test_tui_safe_quit_modal_opens_from_raw_output_view(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            await pilot.press("f3")
+            await pilot.pause()
+
+            await pilot.press("q")
+            await pilot.pause()
+
+            self.assertTrue(app.safe_quit_dialog_open)
+            self.assertTrue(
+                any(
+                    isinstance(screen, self.QuitAfterRunDialog)
+                    for screen in app.screen_stack
+                )
+            )
 
     async def test_tui_builtin_quit_actions_use_safe_quit_modal(self) -> None:
         app = self.PlanExecutorTui()
