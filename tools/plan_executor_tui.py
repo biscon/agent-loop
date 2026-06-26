@@ -106,12 +106,13 @@ class PlanExecutorTui(App[None]):
     }
 
     #top {
-        height: 5;
-        padding: 0 1;
+        height: 4;
+        padding: 0 1 0 1;
     }
 
     #path-row {
-        height: 3;
+        height: 1;
+        align-vertical: middle;
     }
 
     #paste-hint {
@@ -119,16 +120,25 @@ class PlanExecutorTui(App[None]):
         color: $text-muted;
     }
 
+    #plan-label {
+        width: 6;
+        height: 1;
+        content-align: left middle;
+    }
+
     #plan-path {
         width: 1fr;
+        margin: 0 1 0 0;
     }
 
     #load {
         min-width: 8;
+        margin: 0 1 0 0;
     }
 
     #browse {
         min-width: 10;
+        margin: 0;
     }
 
     #main {
@@ -148,9 +158,9 @@ class PlanExecutorTui(App[None]):
     }
 
     #options {
-        height: 16;
+        height: 14;
         border: round $accent;
-        padding: 1 2;
+        padding: 0 1;
     }
 
     #log {
@@ -160,16 +170,35 @@ class PlanExecutorTui(App[None]):
     }
 
     .option-row {
-        height: 2;
+        height: 1;
+        margin: 0;
+        align-vertical: middle;
     }
 
     .option-group {
         width: 18;
+        height: 1;
         text-style: bold;
+        content-align: left middle;
     }
 
     .option-label {
         width: 16;
+        height: 1;
+        content-align: left middle;
+    }
+
+    #options Input {
+        margin: 0;
+    }
+
+    #options Checkbox {
+        margin: 0 2 0 0;
+    }
+
+    #options Label {
+        padding: 0;
+        margin: 0;
     }
 
     .short-input {
@@ -184,7 +213,7 @@ class PlanExecutorTui(App[None]):
         height: 4;
         border: round $accent;
         padding: 0 1;
-        margin-top: 1;
+        margin: 1 0 0 0;
     }
     """
 
@@ -197,6 +226,7 @@ class PlanExecutorTui(App[None]):
     def __init__(self, initial_plan_path: str | None = None) -> None:
         super().__init__()
         self.initial_plan_path = initial_plan_path or ""
+        self.plan_path_text = self.initial_plan_path
         self.loaded_view: plan_executor.PlanStatusView | None = None
         self.log_lines: list[str] = []
 
@@ -204,14 +234,15 @@ class PlanExecutorTui(App[None]):
         yield Header(show_clock=True)
         with Vertical(id="top"):
             with Horizontal(id="path-row"):
-                yield Label("Plan:")
+                yield Label("Plan:", id="plan-label")
                 yield Input(
                     value=self.initial_plan_path,
                     placeholder="docs/my_plan.md",
                     id="plan-path",
+                    compact=True,
                 )
-                yield Button("Load", id="load", variant="primary")
-                yield Button("Browse", id="browse")
+                yield Button("Load", id="load", variant="primary", compact=True)
+                yield Button("Browse", id="browse", compact=True)
             yield Static(
                 "Paste paths using your terminal paste shortcut, usually Ctrl+Shift+V.",
                 id="paste-hint",
@@ -222,28 +253,33 @@ class PlanExecutorTui(App[None]):
         with Vertical(id="options"):
             with Horizontal(classes="option-row"):
                 yield Label("Run:", classes="option-group")
-                yield Checkbox("Run all", id="run-all")
+                yield Checkbox("Run all", id="run-all", compact=True)
                 yield Label("Max passes:", classes="option-label")
-                yield Input(value="10", id="max-passes", classes="short-input")
+                yield Input(value="10", id="max-passes", classes="short-input", compact=True)
             with Horizontal(classes="option-row"):
                 yield Label("Quality gates:", classes="option-group")
-                yield Checkbox("Review after pass", id="review-after-pass")
-                yield Checkbox("Fix after review", id="fix-after-review")
+                yield Checkbox("Review after pass", id="review-after-pass", compact=True)
+                yield Checkbox("Fix after review", id="fix-after-review", compact=True)
             with Horizontal(classes="option-row"):
                 yield Label("Git:", classes="option-group")
-                yield Checkbox("Commit after pass", id="commit-after-pass")
+                yield Checkbox("Commit after pass", id="commit-after-pass", compact=True)
                 yield Label("Commit prefix:", classes="option-label")
-                yield Input(value="plan", id="commit-prefix", classes="short-input")
+                yield Input(value="plan", id="commit-prefix", classes="short-input", compact=True)
             with Horizontal(classes="option-row"):
                 yield Label("Plan copy:", classes="option-group")
-                yield Checkbox("Copy to run dir", id="copy-to-run-dir")
+                yield Checkbox("Copy to run dir", id="copy-to-run-dir", compact=True)
                 yield Label("Run dir:", classes="option-label")
-                yield Input(placeholder=".agent-runs/example", id="run-dir", classes="medium-input")
+                yield Input(
+                    placeholder=".agent-runs/example",
+                    id="run-dir",
+                    classes="medium-input",
+                    compact=True,
+                )
             with Horizontal(classes="option-row"):
                 yield Label("Runtime:", classes="option-group")
-                yield Checkbox("Inhibit sleep", id="inhibit-sleep")
+                yield Checkbox("Inhibit sleep", id="inhibit-sleep", compact=True)
                 yield Label("Codex bin:", classes="option-label")
-                yield Input(value="codex", id="codex-bin", classes="medium-input")
+                yield Input(value="codex", id="codex-bin", classes="medium-input", compact=True)
             yield Label("TUI execution is not implemented in V3.0. Quit: q or Ctrl+C")
             # Future views can replace or sit beside this preview: dashboard, raw stream, review/fix logs.
             yield Static("", id="command-preview")
@@ -254,12 +290,12 @@ class PlanExecutorTui(App[None]):
         self.append_log("TUI started.")
         self.update_command_preview()
         if self.initial_plan_path:
-            if self.load_plan():
+            if self.load_plan(self.initial_plan_path):
                 self.clear_entry_focus()
 
     @on(Button.Pressed, "#load")
     def load_button_pressed(self) -> None:
-        self.load_plan()
+        self.load_plan(self.plan_path_text)
 
     @on(Button.Pressed, "#browse")
     def browse_button_pressed(self) -> None:
@@ -269,12 +305,14 @@ class PlanExecutorTui(App[None]):
         )
 
     @on(Input.Submitted, "#plan-path")
-    def plan_path_submitted(self) -> None:
-        if self.load_plan():
+    def plan_path_submitted(self, event: Input.Submitted) -> None:
+        if self.load_plan(event.value):
             self.clear_entry_focus()
 
     @on(Input.Changed)
     def input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "plan-path":
+            self.plan_path_text = event.value.strip()
         if event.input.id in {
             "plan-path",
             "max-passes",
@@ -297,18 +335,29 @@ class PlanExecutorTui(App[None]):
     def browse_finished(self, selected_path: Path | None) -> None:
         if selected_path is None:
             return
-        self.query_one("#plan-path", Input).value = str(selected_path)
-        if self.load_plan():
+        if self.load_plan(str(selected_path)):
             self.clear_entry_focus()
 
     def clear_entry_focus(self) -> None:
         self.query_one("#plan-path", Input).blur()
         self.set_focus(None)
 
-    def load_plan(self) -> bool:
-        plan_text = self.query_one("#plan-path", Input).value.strip()
-        if not plan_text:
-            self.append_log("Failed to load plan: plan path is empty.")
+    def load_plan(self, plan_path: str | None = None) -> bool:
+        if plan_path is None:
+            plan_path = self.plan_path_text
+        plan_text = plan_path.strip()
+        self.plan_path_text = plan_text
+        path_input = self.query_one("#plan-path", Input)
+        if path_input.value != plan_text:
+            path_input.value = plan_text
+        state = plan_executor.load_tui_plan_state(plan_text)
+        if state.view is None:
+            error = state.load_error or "unknown error"
+            self.loaded_view = None
+            self.render_invalid_plan(error)
+            self.append_log(f"Failed to load plan: {error}")
+            self.update_command_preview()
+            self.query_one("#plan-path", Input).focus()
             return False
 
         previous_selected = (
@@ -316,11 +365,7 @@ class PlanExecutorTui(App[None]):
             if self.loaded_view is not None and self.loaded_view.selected is not None
             else None
         )
-        try:
-            view = plan_executor.build_plan_status_view(Path(plan_text))
-        except plan_executor.PlanError as exc:
-            self.append_log(f"Failed to load plan: {exc}")
-            return False
+        view = state.view
 
         self.loaded_view = view
         self.render_progress(view)
@@ -342,6 +387,12 @@ class PlanExecutorTui(App[None]):
             indent = "  " if item.parent is not None else ""
             lines.append(f"{indent}{item.id} {item.status}")
         self.query_one("#progress", Static).update("\n".join(lines))
+
+    def render_invalid_plan(self, error: str) -> None:
+        self.query_one("#progress", Static).update("Progress\n\nNo valid plan loaded.")
+        self.query_one("#selection", Static).update(
+            f"Current Selection\n\nFailed to load plan: {error}"
+        )
 
     def render_selection(self, view: plan_executor.PlanStatusView) -> None:
         lines = [
@@ -373,8 +424,7 @@ class PlanExecutorTui(App[None]):
 
     def update_command_preview(self) -> None:
         options = self.current_options()
-        plan_path = self.query_one("#plan-path", Input).value.strip()
-        preview = plan_executor.build_tui_command_preview(plan_path, options)
+        preview = plan_executor.build_tui_command_preview(self.plan_path_text, options)
         self.query_one("#command-preview", Static).update(f"Command preview:\n{preview}")
 
     def current_options(self) -> plan_executor.TuiOptions:

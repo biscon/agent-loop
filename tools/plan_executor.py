@@ -130,6 +130,13 @@ class TuiOptions:
 
 
 @dataclass(frozen=True)
+class TuiPlanLoadState:
+    input_path: str
+    view: PlanStatusView | None
+    load_error: str | None = None
+
+
+@dataclass(frozen=True)
 class PlanFiles:
     original_plan_file: Path
     plan_file: Path
@@ -617,6 +624,21 @@ def build_plan_status_view(plan_file: Path, include_parents: bool = False) -> Pl
         suggested_prompt=suggested_prompt,
         warning=selection.warning,
     )
+
+
+def load_tui_plan_state(plan_path: str) -> TuiPlanLoadState:
+    input_path = plan_path.strip()
+    if not input_path:
+        return TuiPlanLoadState(
+            input_path=input_path,
+            view=None,
+            load_error="plan path is empty.",
+        )
+    try:
+        view = build_plan_status_view(Path(input_path))
+    except PlanError as exc:
+        return TuiPlanLoadState(input_path=input_path, view=None, load_error=str(exc))
+    return TuiPlanLoadState(input_path=input_path, view=view)
 
 
 def build_tui_command_preview(plan_path: str, options: TuiOptions) -> str:

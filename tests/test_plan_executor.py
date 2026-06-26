@@ -12,6 +12,17 @@ from tools import plan_executor
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_PLAN = REPO_ROOT / "docs/agent_loop_test_plan.md"
 CLI = [sys.executable, str(REPO_ROOT / "tools/plan_executor.py")]
+VALID_TUI_PLAN = "docs/agent_loop_test_plan.md"
+INVALID_TUI_PLAN = "docs/runner_compatible_plans.md"
+
+
+def import_tui_or_skip():
+    try:
+        from textual.widgets import Input, Static
+        from tools.plan_executor_tui import PlanExecutorTui
+    except ImportError as exc:
+        raise unittest.SkipTest("Textual is not available") from exc
+    return PlanExecutorTui, Input, Static
 
 
 def plan_markdown(state: dict, opener: str = "```plan-state-json") -> str:
@@ -74,6 +85,85 @@ def env_with_fake_git(tmp: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     return env
+
+
+class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.PlanExecutorTui, self.Input, self.Static = import_tui_or_skip()
+
+    def panel_text(self, app, selector: str) -> str:
+        return str(app.query_one(selector, self.Static).content)
+
+    async def set_plan_path(self, app, pilot, plan_path: str) -> None:
+        app.query_one("#plan-path", self.Input).value = plan_path
+        await pilot.pause()
+
+    async def click_load(self, pilot) -> None:
+        await pilot.click("#load")
+        await pilot.pause()
+
+    def assert_invalid_plan_visible(self, app) -> None:
+        self.assertIn("No valid plan loaded.", self.panel_text(app, "#progress"))
+        selection_text = self.panel_text(app, "#selection")
+        self.assertIn("Failed to load plan:", selection_text)
+        self.assertNotIn("Selected ID: phase_01", selection_text)
+
+    def assert_valid_plan_visible(self, app) -> None:
+        selection_text = self.panel_text(app, "#selection")
+        self.assertIn("Plan ID: agent_loop_test_plan", selection_text)
+        self.assertIn("Selected ID: phase_01", selection_text)
+
+    async def test_tui_load_button_uses_current_visible_path_after_valid_then_invalid(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+            self.assert_valid_plan_visible(app)
+
+            await self.set_plan_path(app, pilot, INVALID_TUI_PLAN)
+            await self.click_load(pilot)
+
+            self.assert_invalid_plan_visible(app)
+
+    async def test_tui_load_button_recovers_after_invalid_then_valid(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+            self.assert_valid_plan_visible(app)
+
+            await self.set_plan_path(app, pilot, INVALID_TUI_PLAN)
+            await self.click_load(pilot)
+            self.assert_invalid_plan_visible(app)
+
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+
+            self.assert_valid_plan_visible(app)
+
+    async def test_tui_browse_invalid_after_valid_clears_stale_state(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+            await self.click_load(pilot)
+            self.assert_valid_plan_visible(app)
+
+            app.browse_finished(Path(INVALID_TUI_PLAN))
+            await pilot.pause()
+
+            self.assert_invalid_plan_visible(app)
+
+    async def test_tui_browse_valid_after_invalid_loads_immediately(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await self.set_plan_path(app, pilot, INVALID_TUI_PLAN)
+            await self.click_load(pilot)
+            self.assert_invalid_plan_visible(app)
+
+            app.browse_finished(Path(VALID_TUI_PLAN))
+            await pilot.pause()
+
+            self.assert_valid_plan_visible(app)
 
 
 def make_fake_codex(
@@ -416,6 +506,57 @@ class PlanExecutorTests(unittest.TestCase):
         self.assertEqual(view.selected.title, "Next phase")
         self.assertEqual(view.selected.status, "Not Started")
         self.assertEqual(view.suggested_prompt, f"Read {plan_file} and execute phase_02 only.")
+
+    def test_tui_plan_load_state_valid_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_file = Path(tmp) / "plan.md"
+            write_plan(plan_file, two_phase_state())
+
+            state = plan_executor.load_tui_plan_state(f"  {plan_file}  ")
+
+        self.assertEqual(state.input_path, str(plan_file))
+        self.assertIsNone(state.load_error)
+        self.assertIsNotNone(state.view)
+        self.assertEqual(state.view.plan_id, "test_plan")
+
+    def test_tui_plan_load_state_invalid_plan_is_stateless_after_valid_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid_plan = Path(tmp) / "valid.md"
+            invalid_plan = Path(tmp) / "invalid.md"
+            write_plan(valid_plan, two_phase_state())
+            invalid_plan.write_text("# Invalid\n\nNo plan state here.\n", encoding="utf-8")
+
+            valid_state = plan_executor.load_tui_plan_state(str(valid_plan))
+            invalid_state = plan_executor.load_tui_plan_state(str(invalid_plan))
+
+        self.assertIsNotNone(valid_state.view)
+        self.assertIsNone(valid_state.load_error)
+        self.assertIsNone(invalid_state.view)
+        self.assertIsNotNone(invalid_state.load_error)
+        self.assertIn("missing plan-state-json", invalid_state.load_error)
+
+    def test_tui_plan_load_state_empty_path(self) -> None:
+        state = plan_executor.load_tui_plan_state("  ")
+
+        self.assertEqual(state.input_path, "")
+        self.assertIsNone(state.view)
+        self.assertEqual(state.load_error, "plan path is empty.")
+
+    def test_tui_plan_load_state_valid_plan_after_invalid_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid_plan = Path(tmp) / "valid.md"
+            invalid_plan = Path(tmp) / "invalid.md"
+            write_plan(valid_plan, two_phase_state())
+            invalid_plan.write_text("# Invalid\n\nNo plan state here.\n", encoding="utf-8")
+
+            invalid_state = plan_executor.load_tui_plan_state(str(invalid_plan))
+            valid_state = plan_executor.load_tui_plan_state(str(valid_plan))
+
+        self.assertIsNone(invalid_state.view)
+        self.assertIsNotNone(invalid_state.load_error)
+        self.assertIsNone(valid_state.load_error)
+        self.assertIsNotNone(valid_state.view)
+        self.assertEqual(valid_state.view.plan_id, "test_plan")
 
     def test_command_preview_for_tui_options(self) -> None:
         preview = plan_executor.build_tui_command_preview(
