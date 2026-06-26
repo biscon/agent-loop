@@ -34,6 +34,9 @@ except ImportError:
 
 
 MAX_RAW_OUTPUT_LINES = 5000
+MAX_RAW_OUTPUT_RENDER_LINES = 1000
+MAX_RAW_OUTPUT_RENDER_LINE_CHARS = 4000
+RAW_OUTPUT_REFRESH_INTERVAL_SECONDS = 0.15
 RAW_OUTPUT_TRUNCATION_TEXT = "[output truncated: oldest lines dropped]"
 TUI_RESULT_JSON_PATH = plan_executor.DEFAULT_RUNS_DIR / "tui-latest-run-result.json"
 
@@ -200,13 +203,32 @@ class LatestRunMetadata:
     original_plan_file: str | None = None
     run_dir: str | None = None
     logs_dir: str | None = None
+    selected_before_id: str | None = None
+    selected_before_title: str | None = None
     review_requested: bool | None = None
     fix_after_review_requested: bool | None = None
+    review_verdict: str | None = None
+    review_summary: str | None = None
     review_result_md: str | None = None
     review_result_json: str | None = None
+    review_after_fix_verdict: str | None = None
+    review_after_fix_summary: str | None = None
     review_after_fix_result_md: str | None = None
     review_after_fix_result_json: str | None = None
     load_error: str | None = None
+
+
+def optional_str(raw: dict[str, Any], key: str) -> str | None:
+    value = raw.get(key)
+    return value if isinstance(value, str) else None
+
+
+def selected_item_field(raw: dict[str, Any], key: str) -> str | None:
+    selected_before = raw.get("selected_before")
+    if not isinstance(selected_before, dict):
+        return None
+    value = selected_before.get(key)
+    return value if isinstance(value, str) else None
 
 
 def load_latest_run_metadata(path: Path) -> LatestRunMetadata:
@@ -229,14 +251,12 @@ def load_latest_run_metadata(path: Path) -> LatestRunMetadata:
         )
     return LatestRunMetadata(
         result_json_path=str(path),
-        plan_file=raw.get("plan_file") if isinstance(raw.get("plan_file"), str) else None,
-        original_plan_file=(
-            raw.get("original_plan_file")
-            if isinstance(raw.get("original_plan_file"), str)
-            else None
-        ),
-        run_dir=raw.get("run_dir") if isinstance(raw.get("run_dir"), str) else None,
-        logs_dir=raw.get("logs_dir") if isinstance(raw.get("logs_dir"), str) else None,
+        plan_file=optional_str(raw, "plan_file"),
+        original_plan_file=optional_str(raw, "original_plan_file"),
+        run_dir=optional_str(raw, "run_dir"),
+        logs_dir=optional_str(raw, "logs_dir"),
+        selected_before_id=selected_item_field(raw, "id"),
+        selected_before_title=selected_item_field(raw, "title"),
         review_requested=(
             raw.get("review_requested")
             if isinstance(raw.get("review_requested"), bool)
@@ -247,26 +267,181 @@ def load_latest_run_metadata(path: Path) -> LatestRunMetadata:
             if isinstance(raw.get("fix_after_review_requested"), bool)
             else None
         ),
-        review_result_md=(
-            raw.get("review_result_md")
-            if isinstance(raw.get("review_result_md"), str)
-            else None
+        review_verdict=optional_str(raw, "review_verdict"),
+        review_summary=optional_str(raw, "review_summary"),
+        review_result_md=optional_str(raw, "review_result_md"),
+        review_result_json=optional_str(raw, "review_result_json"),
+        review_after_fix_verdict=optional_str(raw, "review_after_fix_verdict"),
+        review_after_fix_summary=optional_str(raw, "review_after_fix_summary"),
+        review_after_fix_result_md=optional_str(raw, "review_after_fix_result_md"),
+        review_after_fix_result_json=optional_str(raw, "review_after_fix_result_json"),
+    )
+
+
+@dataclass(frozen=True)
+class ReviewArtifactSelection:
+    status: str
+    artifact_path: Path | None = None
+    artifact_label: str | None = None
+    json_path: Path | None = None
+    message: str | None = None
+    error: str | None = None
+
+
+def readable_file(path_text: str | None) -> Path | None:
+    if not path_text:
+        return None
+    path = Path(path_text)
+    try:
+        return path if path.is_file() else None
+    except OSError:
+        return None
+
+
+def select_latest_review_artifact(
+    metadata: LatestRunMetadata | None,
+) -> ReviewArtifactSelection:
+    if metadata is None:
+        return ReviewArtifactSelection(
+            status="no_metadata",
+            message=(
+                "No review result yet.\n"
+                "Run a pass with Review after pass enabled to capture a review."
+            ),
+        )
+    if metadata.load_error:
+        return ReviewArtifactSelection(
+            status="metadata_error",
+            message=f"Latest run metadata could not be loaded:\n{metadata.load_error}",
+            error=metadata.load_error,
+        )
+    if metadata.review_requested is False:
+        return ReviewArtifactSelection(
+            status="review_not_requested",
+            message=(
+                "No review was run for the latest pass.\n"
+                "Enable Review after pass to show review output here."
+            ),
+        )
+
+    candidates = [
+        (
+            "Review after fix",
+            metadata.review_after_fix_result_md,
+            metadata.review_after_fix_result_json,
         ),
-        review_result_json=(
-            raw.get("review_result_json")
-            if isinstance(raw.get("review_result_json"), str)
-            else None
-        ),
-        review_after_fix_result_md=(
-            raw.get("review_after_fix_result_md")
-            if isinstance(raw.get("review_after_fix_result_md"), str)
-            else None
-        ),
-        review_after_fix_result_json=(
-            raw.get("review_after_fix_result_json")
-            if isinstance(raw.get("review_after_fix_result_json"), str)
-            else None
-        ),
+        ("Review", metadata.review_result_md, metadata.review_result_json),
+    ]
+    missing_paths = []
+    for label, markdown_path_text, json_path_text in candidates:
+        if not markdown_path_text:
+            continue
+        markdown_path = Path(markdown_path_text)
+        selected_path = readable_file(markdown_path_text)
+        if selected_path is not None:
+            return ReviewArtifactSelection(
+                status="selected",
+                artifact_path=selected_path,
+                artifact_label=label,
+                json_path=Path(json_path_text) if json_path_text else None,
+            )
+        missing_paths.append(str(markdown_path))
+
+    if missing_paths:
+        return ReviewArtifactSelection(
+            status="artifact_unreadable",
+            message=(
+                "Review was requested, but no review markdown artifact was found."
+            ),
+            error="\n".join(missing_paths),
+        )
+    return ReviewArtifactSelection(
+        status="artifact_missing",
+        message="Review was requested, but no review markdown artifact was found.",
+    )
+
+
+def load_review_markdown(selection: ReviewArtifactSelection) -> tuple[str | None, str | None]:
+    if selection.artifact_path is None:
+        return None, selection.message
+    try:
+        return selection.artifact_path.read_text(encoding="utf-8"), None
+    except OSError as exc:
+        return (
+            None,
+            f"Could not read review artifact:\n{selection.artifact_path}\n{exc}",
+        )
+
+
+def read_review_summary_from_json(path: Path | None) -> tuple[str | None, str | None]:
+    if path is None:
+        return None, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+    verdict = raw.get("verdict")
+    summary = raw.get("summary")
+    return (
+        verdict if isinstance(verdict, str) and verdict else None,
+        summary if isinstance(summary, str) and summary else None,
+    )
+
+
+def review_run_text(metadata: LatestRunMetadata | None) -> str:
+    if metadata is None or metadata.selected_before_id is None:
+        return "Not available"
+    if metadata.selected_before_title:
+        return f"{metadata.selected_before_id} - {metadata.selected_before_title}"
+    return metadata.selected_before_id
+
+
+def review_status_text(
+    metadata: LatestRunMetadata | None,
+    selection: ReviewArtifactSelection,
+) -> str:
+    if selection.status != "selected":
+        return "Unavailable"
+    if metadata is None:
+        return "Review available"
+    if selection.artifact_label == "Review after fix":
+        verdict = metadata.review_after_fix_verdict
+        summary = metadata.review_after_fix_summary
+    else:
+        verdict = metadata.review_verdict
+        summary = metadata.review_summary
+    if verdict is None and summary is None:
+        verdict, summary = read_review_summary_from_json(selection.json_path)
+    if verdict and summary:
+        return f"{verdict} - {summary}"
+    if verdict:
+        return verdict
+    if summary:
+        return summary
+    return "Review available"
+
+
+def render_review_details(
+    metadata: LatestRunMetadata | None,
+    selection: ReviewArtifactSelection,
+) -> str:
+    if selection.status != "selected":
+        return "Review"
+    return "\n".join(
+        [
+            "Review",
+            "",
+            "Run:",
+            f"  {review_run_text(metadata)}",
+            "",
+            "Source:",
+            f"  {selection.artifact_path}",
+            "",
+            "Status:",
+            f"  {review_status_text(metadata, selection)}",
+        ]
     )
 
 
@@ -384,7 +559,18 @@ def render_raw_output_details(state: RawOutputState) -> str:
     )
 
 
-def render_raw_output_lines(state: RawOutputState) -> str:
+def render_raw_output_line(line: RawOutputLine) -> str:
+    text = line.text
+    if len(text) > MAX_RAW_OUTPUT_RENDER_LINE_CHARS:
+        text = f"{text[:MAX_RAW_OUTPUT_RENDER_LINE_CHARS]} [line truncated]"
+    return f"[{line.stream}] {text}"
+
+
+def render_raw_output_lines(
+    state: RawOutputState,
+    *,
+    max_render_lines: int = MAX_RAW_OUTPUT_RENDER_LINES,
+) -> str:
     if (
         state.selected_id is None
         and state.command is None
@@ -395,7 +581,15 @@ def render_raw_output_lines(state: RawOutputState) -> str:
     rendered = []
     if state.truncated:
         rendered.append(RAW_OUTPUT_TRUNCATION_TEXT)
-    rendered.extend(f"[{line.stream}] {line.text}" for line in state.lines)
+    if max_render_lines > 0 and len(state.lines) > max_render_lines:
+        rendered.append(
+            "[output view showing latest "
+            f"{max_render_lines} of {len(state.lines)} retained lines]"
+        )
+        lines = state.lines[-max_render_lines:]
+    else:
+        lines = state.lines
+    rendered.extend(render_raw_output_line(line) for line in lines)
     if not rendered:
         rendered.append("No output captured yet.")
     return "\n".join(rendered)
@@ -671,11 +865,34 @@ class PlanExecutorTui(App[None]):
     #raw-output-text {
         height: auto;
     }
+
+    #review-view {
+        height: 1fr;
+        padding: 0 1;
+    }
+
+    #review-details {
+        height: 10;
+        border: round $accent;
+        padding: 0 1;
+    }
+
+    #review-scroll {
+        height: 1fr;
+        border: round $accent;
+        padding: 0 1;
+        margin: 1 0 0 0;
+    }
+
+    #review-markdown {
+        height: auto;
+    }
     """
 
     BINDINGS = [
         Binding("f2", "show_dashboard", "Dashboard"),
         Binding("f3", "show_output", "Output"),
+        Binding("f4", "show_review", "Review"),
         Binding("q", "safe_quit", "Quit", priority=True),
         Binding("ctrl+c", "safe_quit", "Quit", priority=True),
         Binding("r", "run_pass", "Run pass"),
@@ -700,7 +917,10 @@ class PlanExecutorTui(App[None]):
         self.current_result_json_path: Path | None = None
         self.current_load_error: str | None = None
         self.elapsed_refresh_timer: Any | None = None
+        self.raw_output_refresh_timer: Any | None = None
         self.raw_output_state = RawOutputState()
+        self.raw_output_dirty = False
+        self.active_view = "dashboard"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -808,14 +1028,25 @@ class PlanExecutorTui(App[None]):
             output_scroll.border_title = "Output"
             with output_scroll:
                 yield Static("", id="raw-output-text")
+        with Vertical(id="review-view"):
+            yield Static("", id="review-details")
+            review_scroll = ScrollableContainer(id="review-scroll", can_focus=True)
+            review_scroll.border_title = "Review"
+            with review_scroll:
+                yield Static("", id="review-markdown")
         yield Footer()
 
     def on_mount(self) -> None:
         self.append_log("TUI started.")
         self.query_one("#raw-output-view").display = False
+        self.query_one("#review-view").display = False
         self.refresh_raw_output_view(auto_scroll=False)
+        self.refresh_review_view(auto_scroll=False)
         self.elapsed_refresh_timer = self.set_interval(
             1.0, self.refresh_running_selection
+        )
+        self.raw_output_refresh_timer = self.set_interval(
+            RAW_OUTPUT_REFRESH_INTERVAL_SECONDS, self.refresh_dirty_raw_output_view
         )
         self.update_command_preview()
         self.update_control_state()
@@ -876,7 +1107,9 @@ class PlanExecutorTui(App[None]):
             self.set_focus(None)
 
     def action_show_dashboard(self) -> None:
+        self.active_view = "dashboard"
         self.query_one("#raw-output-view").display = False
+        self.query_one("#review-view").display = False
         self.query_one("#dashboard-view").display = True
         self.set_focus(None)
 
@@ -884,11 +1117,26 @@ class PlanExecutorTui(App[None]):
         focused = self.focused
         if isinstance(focused, Input):
             focused.blur()
+        self.active_view = "output"
         self.query_one("#dashboard-view").display = False
+        self.query_one("#review-view").display = False
         self.query_one("#raw-output-view").display = True
         output_scroll = self.query_one("#raw-output-scroll", ScrollableContainer)
         self.set_focus(output_scroll)
-        self.refresh_raw_output_view(auto_scroll=True)
+        if self.refresh_raw_output_view(auto_scroll=True):
+            self.raw_output_dirty = False
+
+    def action_show_review(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            focused.blur()
+        self.active_view = "review"
+        self.query_one("#dashboard-view").display = False
+        self.query_one("#raw-output-view").display = False
+        self.query_one("#review-view").display = True
+        review_scroll = self.query_one("#review-scroll", ScrollableContainer)
+        self.set_focus(review_scroll)
+        self.refresh_review_view(auto_scroll=False)
 
     def request_safe_quit(self) -> None:
         if not self.run_in_progress:
@@ -930,6 +1178,7 @@ class PlanExecutorTui(App[None]):
         self.quit_after_run = False
         self.last_run_result = None
         self.latest_run_metadata = None
+        self.refresh_review_view(auto_scroll=False)
         self.current_load_error = None
         self.current_run_selected_id = selected_id
         self.current_result_json_path = TUI_RESULT_JSON_PATH
@@ -1074,24 +1323,57 @@ class PlanExecutorTui(App[None]):
     def update_run_status(self, message: str) -> None:
         self.query_one("#run-status", Label).update(message)
 
-    def refresh_raw_output_view(self, *, auto_scroll: bool = True) -> None:
-        self.query_one("#raw-output-details", Static).update(
-            render_raw_output_details(self.raw_output_state)
-        )
-        self.query_one("#raw-output-text", Static).update(
-            render_raw_output_lines(self.raw_output_state)
-        )
-        if auto_scroll:
+    def refresh_raw_output_view(self, *, auto_scroll: bool = True) -> bool:
+        try:
+            raw_output_details = self.query_one("#raw-output-details", Static)
+            raw_output_text = self.query_one("#raw-output-text", Static)
             output_scroll = self.query_one("#raw-output-scroll", ScrollableContainer)
+        except Exception:
+            return False
+        raw_output_details.update(render_raw_output_details(self.raw_output_state))
+        raw_output_text.update(render_raw_output_lines(self.raw_output_state))
+        if auto_scroll:
             output_scroll.scroll_end(animate=False)
+        return True
+
+    def refresh_dirty_raw_output_view(self) -> None:
+        if not self.raw_output_dirty or self.active_view != "output":
+            return
+        if self.refresh_raw_output_view(auto_scroll=True):
+            self.raw_output_dirty = False
+
+    def refresh_raw_output_if_visible(self, *, auto_scroll: bool = True) -> None:
+        if self.active_view != "output":
+            return
+        if self.refresh_raw_output_view(auto_scroll=auto_scroll):
+            self.raw_output_dirty = False
+
+    def refresh_review_view(self, *, auto_scroll: bool = False) -> None:
+        if self.run_in_progress:
+            self.query_one("#review-details", Static).update("Review")
+            self.query_one("#review-markdown", Static).update(
+                "Run in progress. Review output will be available after completion if review is enabled."
+            )
+        else:
+            selection = select_latest_review_artifact(self.latest_run_metadata)
+            self.query_one("#review-details", Static).update(
+                render_review_details(self.latest_run_metadata, selection)
+            )
+            markdown_text, error = load_review_markdown(selection)
+            self.query_one("#review-markdown", Static).update(
+                markdown_text or error or selection.message or ""
+            )
+        if auto_scroll:
+            review_scroll = self.query_one("#review-scroll", ScrollableContainer)
+            review_scroll.scroll_home(animate=False)
 
     def update_raw_output_status(self, message: str) -> None:
         self.raw_output_state.status = message
-        self.refresh_raw_output_view(auto_scroll=True)
+        self.raw_output_dirty = True
 
     def append_raw_output(self, stream: str, text: str) -> None:
         append_raw_output_line(self.raw_output_state, stream, text)
-        self.refresh_raw_output_view(auto_scroll=True)
+        self.raw_output_dirty = True
 
     def update_control_state(self) -> None:
         has_selected_item = (
@@ -1174,7 +1456,8 @@ class PlanExecutorTui(App[None]):
                 command=shlex.join(argv),
                 status="Running",
             )
-            self.refresh_raw_output_view(auto_scroll=False)
+            self.raw_output_dirty = True
+            self.refresh_raw_output_if_visible(auto_scroll=False)
             try:
                 result_json_path.unlink(missing_ok=True)
             except OSError as exc:
@@ -1194,6 +1477,7 @@ class PlanExecutorTui(App[None]):
             return_code = await process.wait()
             await asyncio.gather(stdout_task, stderr_task)
             self.latest_run_metadata = load_latest_run_metadata(result_json_path)
+            self.refresh_review_view(auto_scroll=False)
             if return_code == 0:
                 self.update_run_status(f"Finished with return code {return_code}")
                 self.update_raw_output_status(f"Finished with return code {return_code}")
@@ -1213,6 +1497,7 @@ class PlanExecutorTui(App[None]):
             self.append_raw_output("runner", f"Failed: {failure_message}")
             self.append_log(f"Run failed: {exc}")
         finally:
+            self.refresh_raw_output_if_visible(auto_scroll=True)
             active_run = self.active_run
             if active_run is not None:
                 self.last_run_result = LastRunResult(
@@ -1228,6 +1513,7 @@ class PlanExecutorTui(App[None]):
             self.current_run_started_at = None
             self.current_result_json_path = None
             self.active_run = None
+            self.refresh_review_view(auto_scroll=False)
             try:
                 if self.load_plan(plan_path, log_load=False, preserve_last_run=True):
                     reloaded_id = (

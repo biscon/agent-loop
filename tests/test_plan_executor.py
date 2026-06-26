@@ -26,7 +26,9 @@ def import_tui_or_skip():
         from tools.plan_executor_tui import (
             ActiveRunSnapshot,
             LastRunResult,
+            LatestRunMetadata,
             MAX_RAW_OUTPUT_LINES,
+            MAX_RAW_OUTPUT_RENDER_LINES,
             PlanExecutorTui,
             QuitAfterRunDialog,
             RAW_OUTPUT_TRUNCATION_TEXT,
@@ -34,8 +36,10 @@ def import_tui_or_skip():
             append_raw_output_line,
             build_selection_panel_text,
             format_elapsed_duration,
+            load_review_markdown,
             render_raw_output_state,
             render_recent_log_lines,
+            select_latest_review_artifact,
             reset_raw_output_state,
             summarize_tui_options,
         )
@@ -45,7 +49,9 @@ def import_tui_or_skip():
         plan_executor_tui,
         ActiveRunSnapshot,
         LastRunResult,
+        LatestRunMetadata,
         MAX_RAW_OUTPUT_LINES,
+        MAX_RAW_OUTPUT_RENDER_LINES,
         PlanExecutorTui,
         QuitAfterRunDialog,
         RAW_OUTPUT_TRUNCATION_TEXT,
@@ -53,6 +59,7 @@ def import_tui_or_skip():
         append_raw_output_line,
         build_selection_panel_text,
         format_elapsed_duration,
+        load_review_markdown,
         render_raw_output_state,
         Button,
         Checkbox,
@@ -60,6 +67,7 @@ def import_tui_or_skip():
         ScrollableContainer,
         Static,
         render_recent_log_lines,
+        select_latest_review_artifact,
         reset_raw_output_state,
         summarize_tui_options,
     )
@@ -137,7 +145,9 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.plan_executor_tui,
             self.ActiveRunSnapshot,
             self.LastRunResult,
+            self.LatestRunMetadata,
             self.MAX_RAW_OUTPUT_LINES,
+            self.MAX_RAW_OUTPUT_RENDER_LINES,
             self.PlanExecutorTui,
             self.QuitAfterRunDialog,
             self.RAW_OUTPUT_TRUNCATION_TEXT,
@@ -145,6 +155,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.append_raw_output_line,
             self.build_selection_panel_text,
             self.format_elapsed_duration,
+            self.load_review_markdown,
             self.render_raw_output_state,
             self.Button,
             self.Checkbox,
@@ -152,6 +163,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             self.ScrollableContainer,
             self.Static,
             self.render_recent_log_lines,
+            self.select_latest_review_artifact,
             self.reset_raw_output_state,
             self.summarize_tui_options,
         ) = import_tui_or_skip()
@@ -168,6 +180,11 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     def raw_output_text(self, app) -> str:
         return self.panel_text(app, "#raw-output-details") + "\n" + self.panel_text(
             app, "#raw-output-text"
+        )
+
+    def review_text(self, app) -> str:
+        return self.panel_text(app, "#review-details") + "\n" + self.panel_text(
+            app, "#review-markdown"
         )
 
     async def set_plan_path(self, app, pilot, plan_path: str) -> None:
@@ -438,6 +455,49 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("line 2", text)
         self.assertIn("line 4", text)
 
+    def test_raw_output_helper_caps_rendered_tail_without_dropping_buffer(self) -> None:
+        state = self.RawOutputState()
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_01",
+            selected_title="Some title",
+            command="fake-command",
+            status="Running",
+        )
+
+        for index in range(self.MAX_RAW_OUTPUT_RENDER_LINES + 5):
+            self.append_raw_output_line(state, "stdout", f"line {index}")
+
+        text = self.render_raw_output_state(state)
+        self.assertEqual(len(state.lines), self.MAX_RAW_OUTPUT_RENDER_LINES + 5)
+        self.assertIn(
+            "[output view showing latest "
+            f"{self.MAX_RAW_OUTPUT_RENDER_LINES} of "
+            f"{self.MAX_RAW_OUTPUT_RENDER_LINES + 5} retained lines]",
+            text,
+        )
+        self.assertNotIn("[stdout] line 0", text)
+        self.assertIn("[stdout] line 5", text)
+        self.assertIn(f"[stdout] line {self.MAX_RAW_OUTPUT_RENDER_LINES + 4}", text)
+
+    def test_raw_output_helper_truncates_only_displayed_long_line(self) -> None:
+        state = self.RawOutputState()
+        self.reset_raw_output_state(
+            state,
+            selected_id="phase_01",
+            selected_title="Some title",
+            command="fake-command",
+            status="Running",
+        )
+        long_line = "x" * 5000
+
+        self.append_raw_output_line(state, "stdout", long_line)
+
+        text = self.render_raw_output_state(state)
+        self.assertEqual(state.lines[0].text, long_line)
+        self.assertIn("[line truncated]", text)
+        self.assertNotIn(long_line, text)
+
     def test_raw_output_helper_clear_on_new_run(self) -> None:
         state = self.RawOutputState()
         self.reset_raw_output_state(
@@ -462,11 +522,109 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("new-command", text)
         self.assertNotIn("old output", text)
 
+    def test_review_artifact_selection_no_metadata(self) -> None:
+        selection = self.select_latest_review_artifact(None)
+
+        self.assertEqual(selection.status, "no_metadata")
+        self.assertIn("No review result yet.", selection.message)
+
+    def test_review_artifact_selection_metadata_load_error(self) -> None:
+        metadata = self.LatestRunMetadata(
+            result_json_path="result.json",
+            load_error="failed to parse result metadata: fake",
+        )
+
+        selection = self.select_latest_review_artifact(metadata)
+
+        self.assertEqual(selection.status, "metadata_error")
+        self.assertIn("Latest run metadata could not be loaded:", selection.message)
+        self.assertIn("fake", selection.message)
+
+    def test_review_artifact_selection_review_not_requested(self) -> None:
+        metadata = self.LatestRunMetadata(
+            result_json_path="result.json",
+            review_requested=False,
+        )
+
+        selection = self.select_latest_review_artifact(metadata)
+
+        self.assertEqual(selection.status, "review_not_requested")
+        self.assertIn("No review was run for the latest pass.", selection.message)
+
+    def test_review_artifact_selection_uses_review_result_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            review_md = Path(tmp) / "review_result.md"
+            review_json = Path(tmp) / "review_result.json"
+            review_md.write_text("# Review\n", encoding="utf-8")
+            metadata = self.LatestRunMetadata(
+                result_json_path="result.json",
+                review_requested=True,
+                review_result_md=str(review_md),
+                review_result_json=str(review_json),
+            )
+
+            selection = self.select_latest_review_artifact(metadata)
+
+        self.assertEqual(selection.status, "selected")
+        self.assertEqual(selection.artifact_path, review_md)
+        self.assertEqual(selection.json_path, review_json)
+
+    def test_review_artifact_selection_prefers_after_fix_result_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            review_md = Path(tmp) / "review_result.md"
+            after_fix_md = Path(tmp) / "review_after_fix_result.md"
+            review_md.write_text("# Review\n", encoding="utf-8")
+            after_fix_md.write_text("# Review after fix\n", encoding="utf-8")
+            metadata = self.LatestRunMetadata(
+                result_json_path="result.json",
+                review_requested=True,
+                review_result_md=str(review_md),
+                review_after_fix_result_md=str(after_fix_md),
+            )
+
+            selection = self.select_latest_review_artifact(metadata)
+
+        self.assertEqual(selection.status, "selected")
+        self.assertEqual(selection.artifact_path, after_fix_md)
+        self.assertEqual(selection.artifact_label, "Review after fix")
+
+    def test_review_artifact_selection_missing_artifact(self) -> None:
+        metadata = self.LatestRunMetadata(
+            result_json_path="result.json",
+            review_requested=True,
+            review_result_md="/tmp/missing-review-artifact.md",
+        )
+
+        selection = self.select_latest_review_artifact(metadata)
+
+        self.assertEqual(selection.status, "artifact_unreadable")
+        self.assertIn(
+            "Review was requested, but no review markdown artifact was found.",
+            selection.message,
+        )
+
+    def test_review_markdown_loading_reads_selected_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            review_md = Path(tmp) / "review_result.md"
+            review_md.write_text("# Fake review\n\nReview body\n", encoding="utf-8")
+            metadata = self.LatestRunMetadata(
+                result_json_path="result.json",
+                review_requested=True,
+                review_result_md=str(review_md),
+            )
+            selection = self.select_latest_review_artifact(metadata)
+
+            markdown_text, error = self.load_review_markdown(selection)
+
+        self.assertIsNone(error)
+        self.assertIn("Review body", markdown_text)
+
     def test_tui_bindings_include_dashboard_and_output_footer_labels(self) -> None:
         bindings_by_key = {binding.key: binding for binding in self.PlanExecutorTui.BINDINGS}
 
         self.assertEqual(bindings_by_key["f2"].description, "Dashboard")
         self.assertEqual(bindings_by_key["f3"].description, "Output")
+        self.assertEqual(bindings_by_key["f4"].description, "Review")
 
     async def test_tui_run_pass_disabled_before_valid_plan_load(self) -> None:
         app = self.PlanExecutorTui()
@@ -494,6 +652,27 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.query_one("#raw-output-scroll", self.ScrollableContainer),
             )
 
+    async def test_tui_f4_shows_review_empty_state(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            self.assertTrue(app.query_one("#dashboard-view").display)
+            self.assertFalse(app.query_one("#raw-output-view").display)
+            self.assertFalse(app.query_one("#review-view").display)
+
+            await pilot.press("f4")
+            await pilot.pause()
+
+            self.assertFalse(app.query_one("#dashboard-view").display)
+            self.assertFalse(app.query_one("#raw-output-view").display)
+            self.assertTrue(app.query_one("#review-view").display)
+            self.assertIn("No review result yet.", self.review_text(app))
+            self.assertIs(
+                app.focused,
+                app.query_one("#review-scroll", self.ScrollableContainer),
+            )
+
     async def test_tui_f2_returns_to_dashboard_and_clears_hidden_input_focus(self) -> None:
         app = self.PlanExecutorTui()
         async with app.run_test() as pilot:
@@ -510,7 +689,79 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(app.query_one("#dashboard-view").display)
             self.assertFalse(app.query_one("#raw-output-view").display)
+            self.assertFalse(app.query_one("#review-view").display)
             self.assertIsNone(app.focused)
+
+    async def test_tui_f2_f3_f4_switching_hides_inactive_views(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press("f4")
+            await pilot.pause()
+            self.assertFalse(app.query_one("#dashboard-view").display)
+            self.assertFalse(app.query_one("#raw-output-view").display)
+            self.assertTrue(app.query_one("#review-view").display)
+
+            await pilot.press("f3")
+            await pilot.pause()
+            self.assertFalse(app.query_one("#dashboard-view").display)
+            self.assertTrue(app.query_one("#raw-output-view").display)
+            self.assertFalse(app.query_one("#review-view").display)
+
+            await pilot.press("f2")
+            await pilot.pause()
+            self.assertTrue(app.query_one("#dashboard-view").display)
+            self.assertFalse(app.query_one("#raw-output-view").display)
+            self.assertFalse(app.query_one("#review-view").display)
+
+    async def test_tui_review_view_renders_fake_metadata_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            review_md = Path(tmp) / "review_result.md"
+            review_json = Path(tmp) / "review_result.json"
+            review_md.write_text("# Fake review\n\nExpected review body\n", encoding="utf-8")
+            review_json.write_text(
+                json.dumps({"verdict": "pass", "summary": "fake summary"}) + "\n",
+                encoding="utf-8",
+            )
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                app.latest_run_metadata = self.LatestRunMetadata(
+                    result_json_path="result.json",
+                    selected_before_id="phase_01",
+                    selected_before_title="Some title",
+                    review_requested=True,
+                    review_result_md=str(review_md),
+                    review_result_json=str(review_json),
+                )
+                app.refresh_review_view()
+
+                await pilot.press("f4")
+                await pilot.pause()
+
+                review_text = self.review_text(app)
+                self.assertIn("phase_01 - Some title", review_text)
+                self.assertIn(str(review_md), review_text)
+                self.assertIn("pass - fake summary", review_text)
+                self.assertIn("Expected review body", review_text)
+
+    async def test_tui_review_view_falls_back_when_summary_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            review_md = Path(tmp) / "review_result.md"
+            review_md.write_text("# Fake review\n\nNo summary here\n", encoding="utf-8")
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                app.latest_run_metadata = self.LatestRunMetadata(
+                    result_json_path="result.json",
+                    review_requested=True,
+                    review_result_md=str(review_md),
+                )
+                app.refresh_review_view()
+
+                await pilot.press("f4")
+                await pilot.pause()
+
+                self.assertIn("Review available", self.review_text(app))
 
     async def test_tui_escape_still_blurs_dashboard_inputs(self) -> None:
         app = self.PlanExecutorTui()
@@ -741,9 +992,178 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(app.latest_run_metadata)
                 self.assertIn("failed to parse result metadata", app.latest_run_metadata.load_error)
                 self.assertIsNone(app.latest_run_metadata.logs_dir)
+                await pilot.press("f3")
+                await pilot.pause()
                 self.assertIn("Logs dir: .agent-runs/fake/logs/phase_01", self.raw_output_text(app))
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_review_view_does_not_parse_stdout_artifact_paths(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return self.FakeProcess(
+                0,
+                self.fake_stream(
+                    "review_result_md: /tmp/stdout-review-result.md\n"
+                    "Review artifact: /tmp/stdout-review-result.md\n"
+                ),
+                self.fake_stream(),
+            )
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                await pilot.press("f3")
+                await pilot.pause()
+
+                self.assertIn("/tmp/stdout-review-result.md", self.raw_output_text(app))
+
+                await pilot.press("f4")
+                await pilot.pause()
+                self.assertNotIn("/tmp/stdout-review-result.md", self.review_text(app))
+                self.assertIn(
+                    "Latest run metadata could not be loaded:",
+                    self.review_text(app),
+                )
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_noisy_visible_output_is_throttled_and_captured(self) -> None:
+        emitted_lines = 200
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            stdout = "".join(
+                f"visible stdout {index}\n" for index in range(emitted_lines)
+            )
+            stderr = "".join(
+                f"visible stderr {index}\n" for index in range(emitted_lines)
+            )
+            return self.FakeProcess(
+                0,
+                self.fake_stream(stdout),
+                self.fake_stream(stderr),
+            )
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+                await pilot.press("f3")
+                await pilot.pause()
+
+                original_refresh = app.refresh_raw_output_view
+                refresh_calls = 0
+
+                def counted_refresh(*, auto_scroll: bool = True) -> bool:
+                    nonlocal refresh_calls
+                    refresh_calls += 1
+                    return original_refresh(auto_scroll=auto_scroll)
+
+                app.refresh_raw_output_view = counted_refresh
+
+                app.action_run_pass()
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                captured = "\n".join(line.text for line in app.raw_output_state.lines)
+                self.assertIn("visible stdout 0", captured)
+                self.assertIn(f"visible stdout {emitted_lines - 1}", captured)
+                self.assertIn("visible stderr 0", captured)
+                self.assertIn(f"visible stderr {emitted_lines - 1}", captured)
+                self.assertLess(refresh_calls, emitted_lines)
+
+                rendered_log = self.log_text(app)
+                self.assertNotIn("visible stdout", rendered_log)
+                self.assertNotIn("visible stderr", rendered_log)
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_hidden_output_defers_render_until_f3(self) -> None:
+        emitted_lines = 120
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            stdout = "".join(
+                f"hidden stdout {index}\n" for index in range(emitted_lines)
+            )
+            return self.FakeProcess(0, self.fake_stream(stdout), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                original_refresh = app.refresh_raw_output_view
+                refresh_calls = 0
+
+                def counted_refresh(*, auto_scroll: bool = True) -> bool:
+                    nonlocal refresh_calls
+                    refresh_calls += 1
+                    return original_refresh(auto_scroll=auto_scroll)
+
+                app.refresh_raw_output_view = counted_refresh
+
+                app.action_run_pass()
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+
+                captured = "\n".join(line.text for line in app.raw_output_state.lines)
+                self.assertIn("hidden stdout 0", captured)
+                self.assertIn(f"hidden stdout {emitted_lines - 1}", captured)
+                self.assertEqual(refresh_calls, 0)
+                self.assertTrue(app.raw_output_dirty)
+                self.assertIn("Finished with return code 0", app.raw_output_state.status)
+
+                await pilot.press("f3")
+                await pilot.pause()
+
+                self.assertEqual(refresh_calls, 1)
+                self.assertFalse(app.raw_output_dirty)
+                self.assertIn(f"hidden stdout {emitted_lines - 1}", self.raw_output_text(app))
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_raw_output_dirty_survives_failed_refresh(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            await pilot.press("f3")
+            await pilot.pause()
+            app.raw_output_dirty = True
+
+            def failed_refresh(*, auto_scroll: bool = True) -> bool:
+                return False
+
+            app.refresh_raw_output_view = failed_refresh
+            app.refresh_dirty_raw_output_view()
+
+            self.assertTrue(app.raw_output_dirty)
+
+            def successful_refresh(*, auto_scroll: bool = True) -> bool:
+                return True
+
+            app.refresh_raw_output_view = successful_refresh
+            app.refresh_dirty_raw_output_view()
+
+            self.assertFalse(app.raw_output_dirty)
 
     async def test_tui_fake_subprocess_output_appears_only_in_raw_output(self) -> None:
         async def fake_create_subprocess_exec(*args, **kwargs):
@@ -862,6 +1282,24 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             app.run_in_progress = True
             await pilot.press("f3")
+            await pilot.pause()
+
+            await pilot.press("q")
+            await pilot.pause()
+
+            self.assertTrue(app.safe_quit_dialog_open)
+            self.assertTrue(
+                any(
+                    isinstance(screen, self.QuitAfterRunDialog)
+                    for screen in app.screen_stack
+                )
+            )
+
+    async def test_tui_safe_quit_modal_opens_from_review_view(self) -> None:
+        app = self.PlanExecutorTui()
+        async with app.run_test() as pilot:
+            app.run_in_progress = True
+            await pilot.press("f4")
             await pilot.pause()
 
             await pilot.press("q")
