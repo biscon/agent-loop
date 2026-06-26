@@ -279,6 +279,33 @@ if fail_this_call:
     path.chmod(path.stat().st_mode | 0o111)
 
 
+def make_fake_systemd_inhibit(path: Path, marker_path: Path) -> None:
+    script = f"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+marker_path = Path({str(marker_path)!r})
+marker_path.write_text(json.dumps({{
+    "argv": sys.argv[1:],
+    "sleep_inhibited": os.environ.get("PLAN_EXECUTOR_SLEEP_INHIBITED"),
+}}, indent=2), encoding="utf-8")
+
+command_start = None
+for index, arg in enumerate(sys.argv[1:], start=1):
+    if not arg.startswith("--"):
+        command_start = index
+        break
+if command_start is None:
+    raise SystemExit("missing command portion")
+command = sys.argv[command_start:]
+os.execvpe(command[0], command, os.environ)
+"""
+    path.write_text(script, encoding="utf-8")
+    path.chmod(path.stat().st_mode | 0o111)
+
+
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -585,6 +612,203 @@ class PlanExecutorTests(unittest.TestCase):
             self.assertFalse((run_dir / "logs").exists())
             self.assertEqual(list(run_dir.glob("**/plan_before.md")), [])
             self.assertEqual(list(run_dir.glob("**/plan_after.md")), [])
+
+    def test_inhibit_sleep_missing_binary_fails_before_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+            env = dict(os.environ)
+            env.pop("PLAN_EXECUTOR_SLEEP_INHIBITED", None)
+            env["PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"] = str(tmp_path / "missing")
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--inhibit-sleep",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertIn(
+                "--inhibit-sleep requested, but systemd-inhibit was not found.",
+                completed.stderr,
+            )
+
+    def test_inhibit_sleep_non_executable_override_fails_before_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_codex = tmp_path / "fake_codex.py"
+            marker = tmp_path / "marker.json"
+            make_fake_codex(fake_codex, marker, update_plan=True)
+            fake_inhibitor = tmp_path / "systemd-inhibit"
+            fake_inhibitor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            env = dict(os.environ)
+            env.pop("PLAN_EXECUTOR_SLEEP_INHIBITED", None)
+            env["PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"] = str(fake_inhibitor)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--inhibit-sleep",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertIn(
+                "--inhibit-sleep requested, but systemd-inhibit was not found.",
+                completed.stderr,
+            )
+
+    def test_inhibit_sleep_reexecs_through_fake_systemd_inhibit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_inhibitor = tmp_path / "systemd-inhibit"
+            inhibitor_marker = tmp_path / "inhibitor.json"
+            make_fake_systemd_inhibit(fake_inhibitor, inhibitor_marker)
+            env = dict(os.environ)
+            env.pop("PLAN_EXECUTOR_SLEEP_INHIBITED", None)
+            env["PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"] = str(fake_inhibitor)
+
+            completed = subprocess.run(
+                CLI + [str(plan_file), "--status", "--inhibit-sleep"],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            marker_data = json.loads(inhibitor_marker.read_text(encoding="utf-8"))
+            argv = marker_data["argv"]
+            self.assertIn("--who=plan_executor", argv)
+            self.assertIn("--what=idle:sleep", argv)
+            self.assertIn("--mode=block", argv)
+            self.assertIn(sys.executable, argv)
+            self.assertIn(str(REPO_ROOT / "tools/plan_executor.py"), argv)
+            self.assertIn(str(plan_file), argv)
+            self.assertIn("--status", argv)
+            self.assertIn("--inhibit-sleep", argv)
+            self.assertEqual(marker_data["sleep_inhibited"], "1")
+            self.assertIn(
+                "Sleep inhibition requested: re-executing through systemd-inhibit.",
+                completed.stderr,
+            )
+
+    def test_inhibit_sleep_does_not_recurse_when_env_is_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_inhibitor = tmp_path / "systemd-inhibit"
+            inhibitor_marker = tmp_path / "inhibitor.json"
+            make_fake_systemd_inhibit(fake_inhibitor, inhibitor_marker)
+            env = dict(os.environ)
+            env["PLAN_EXECUTOR_SLEEP_INHIBITED"] = "1"
+            env["PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"] = str(fake_inhibitor)
+
+            completed = subprocess.run(
+                CLI + [str(plan_file), "--status", "--inhibit-sleep"],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(inhibitor_marker.exists())
+
+    def test_inhibit_sleep_keeps_json_stdout_parseable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_inhibitor = tmp_path / "systemd-inhibit"
+            inhibitor_marker = tmp_path / "inhibitor.json"
+            make_fake_systemd_inhibit(fake_inhibitor, inhibitor_marker)
+            env = dict(os.environ)
+            env.pop("PLAN_EXECUTOR_SLEEP_INHIBITED", None)
+            env["PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"] = str(fake_inhibitor)
+
+            completed = subprocess.run(
+                CLI + [str(plan_file), "--status", "--json", "--inhibit-sleep"],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            output = json.loads(completed.stdout)
+            self.assertEqual(output["plan_id"], "test_plan")
+            self.assertEqual(output["selected"]["id"], "phase_01")
+            self.assertIn(
+                "Sleep inhibition requested: re-executing through systemd-inhibit.",
+                completed.stderr,
+            )
+            self.assertNotIn("Sleep inhibition", completed.stdout)
+
+    def test_inhibit_sleep_with_execution_uses_fake_codex_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plan_file = tmp_path / "plan.md"
+            write_plan(plan_file, two_phase_state())
+            fake_inhibitor = tmp_path / "systemd-inhibit"
+            inhibitor_marker = tmp_path / "inhibitor.json"
+            make_fake_systemd_inhibit(fake_inhibitor, inhibitor_marker)
+            fake_codex = tmp_path / "fake_codex.py"
+            codex_marker = tmp_path / "codex.json"
+            make_fake_codex(fake_codex, codex_marker, update_plan=True)
+            env = env_with_fake_git(tmp_path)
+            env.pop("PLAN_EXECUTOR_SLEEP_INHIBITED", None)
+            env["PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"] = str(fake_inhibitor)
+
+            completed = subprocess.run(
+                CLI
+                + [
+                    str(plan_file),
+                    "--inhibit-sleep",
+                    "--codex-bin",
+                    str(fake_codex),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(inhibitor_marker.exists())
+            self.assertTrue(codex_marker.exists())
+            marker_data = json.loads(codex_marker.read_text(encoding="utf-8"))
+            self.assertEqual(marker_data["argv"][0], "exec")
+            self.assertEqual(
+                plan_executor.load_json_state(plan_file)["items"][0]["status"],
+                "Completed",
+            )
 
     def test_copy_mode_default_executes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

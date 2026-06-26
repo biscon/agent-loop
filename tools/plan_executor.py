@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,11 @@ LOCAL_GIT_EXCLUDE_PATTERNS = (
 )
 REVIEW_VERDICTS = {"pass", "needs_fix", "needs_human"}
 REVIEW_ISSUE_SEVERITIES = {"blocker", "major", "minor"}
+SLEEP_INHIBITED_ENV = "PLAN_EXECUTOR_SLEEP_INHIBITED"
+SYSTEMD_INHIBIT_BIN_ENV = "PLAN_EXECUTOR_SYSTEMD_INHIBIT_BIN"
+SYSTEMD_INHIBIT_MISSING_ERROR = (
+    "--inhibit-sleep requested, but systemd-inhibit was not found."
+)
 
 
 def positive_int(value: str) -> int:
@@ -398,11 +404,60 @@ def parse_args() -> argparse.Namespace:
         help="Allow unfinished parent phases with child passes to be selected.",
     )
     parser.add_argument(
+        "--inhibit-sleep",
+        action="store_true",
+        help="Re-exec through systemd-inhibit to prevent idle/sleep while running.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print extra validation details.",
     )
     return parser.parse_args()
+
+
+def find_systemd_inhibit() -> str | None:
+    override = os.environ.get(SYSTEMD_INHIBIT_BIN_ENV)
+    if override is not None:
+        override_path = Path(override)
+        if override_path.is_file() and os.access(override_path, os.X_OK):
+            return override
+        return None
+    return shutil.which("systemd-inhibit")
+
+
+def maybe_reexec_with_sleep_inhibit(args: argparse.Namespace) -> None:
+    if not args.inhibit_sleep:
+        return
+    if os.environ.get(SLEEP_INHIBITED_ENV) == "1":
+        if args.verbose:
+            print("Sleep inhibition active.", file=sys.stderr)
+        return
+
+    systemd_inhibit = find_systemd_inhibit()
+    if systemd_inhibit is None:
+        raise SystemExit(SYSTEMD_INHIBIT_MISSING_ERROR)
+
+    env = os.environ.copy()
+    env[SLEEP_INHIBITED_ENV] = "1"
+    command = [
+        systemd_inhibit,
+        "--who=plan_executor",
+        "--what=idle:sleep",
+        "--why=plan_executor running Codex task",
+        "--mode=block",
+        sys.executable,
+        *sys.argv,
+    ]
+
+    print(
+        "Sleep inhibition requested: re-executing through systemd-inhibit.",
+        file=sys.stderr,
+    )
+    try:
+        os.execvpe(systemd_inhibit, command, env)
+    except OSError as exc:
+        raise SystemExit(f"failed to re-exec through systemd-inhibit: {exc}") from exc
 
 
 def is_plan_state_opener(line: str) -> bool:
@@ -2708,6 +2763,7 @@ def main() -> int:
                 "--execute-next is deprecated; execution is now the default.",
                 file=sys.stderr,
             )
+        maybe_reexec_with_sleep_inhibit(args)
         ensure_local_git_exclude(verbose=args.verbose)
         plan_files = prepare_plan_file(original_plan_file, args.copy_to_run_dir)
         raw_state = load_json_state(plan_files.plan_file)
