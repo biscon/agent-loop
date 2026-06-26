@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -144,7 +146,7 @@ class QuitAfterRunDialog(ModalScreen[bool]):
             )
             with Horizontal(id="quit-after-run-actions"):
                 yield Button("Cancel", id="quit-cancel", compact=True)
-                yield Button("Quit after current pass", id="quit-after-run", compact=True)
+                yield Button("Exit after run", id="quit-after-run", compact=True)
 
     @on(Button.Pressed, "#quit-cancel")
     def cancel_pressed(self) -> None:
@@ -163,6 +165,158 @@ def render_recent_log_lines(lines: list[str], visible_count: int = 3) -> str:
     if visible_count <= 0:
         return ""
     return "\n".join(lines[-visible_count:])
+
+
+@dataclass(frozen=True)
+class ActiveRunSnapshot:
+    selected_id: str
+    selected_title: str
+    started_at: datetime
+    options_summary: str
+    codex_bin: str
+
+
+@dataclass
+class LastRunResult:
+    selected_id: str
+    selected_title: str
+    finished_at: datetime
+    return_code: int | None = None
+    failure_message: str | None = None
+    reload_error: str | None = None
+
+
+def format_elapsed_duration(started_at: datetime, now: datetime) -> str:
+    elapsed_seconds = max(0, int((now - started_at).total_seconds()))
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def summarize_tui_options(options: plan_executor.TuiOptions) -> str:
+    enabled = []
+    if options.review_after_pass:
+        enabled.append("review")
+    if options.fix_after_review:
+        enabled.append("fix")
+    if options.commit_after_pass:
+        enabled.append("commit")
+    if options.copy_to_run_dir:
+        enabled.append("copy")
+    if options.inhibit_sleep:
+        enabled.append("inhibit sleep")
+    return ", ".join(enabled) if enabled else "none"
+
+
+def format_run_result(result: LastRunResult) -> str:
+    if result.return_code is not None:
+        if result.return_code == 0:
+            return f"Finished with return code {result.return_code}"
+        return f"Failed with return code {result.return_code}"
+    if result.failure_message:
+        return f"Failed: {result.failure_message}"
+    return "Failed"
+
+
+def append_current_selection_lines(
+    lines: list[str], view: plan_executor.PlanStatusView | None, load_error: str | None
+) -> None:
+    if load_error:
+        lines.extend(["Current selection:", f"  Load failed: {load_error}"])
+        return
+    if view is None:
+        lines.extend(["Current selection:", "  No valid plan loaded."])
+        return
+    if view.selected is None:
+        lines.extend(["Current selection:", "  Plan complete.", "  No runnable item selected."])
+        return
+    item = view.selected
+    lines.extend(["Current selection:", f"  {item.id} - {item.title}"])
+
+
+def build_selection_panel_text(
+    loaded_view: plan_executor.PlanStatusView | None,
+    active_run: ActiveRunSnapshot | None,
+    last_run: LastRunResult | None,
+    load_error: str | None,
+    now: datetime,
+) -> str:
+    lines = ["Current Selection", ""]
+    if active_run is not None:
+        lines.extend(
+            [
+                "Running:",
+                f"  {active_run.selected_id} - {active_run.selected_title}",
+                "",
+                "Started:",
+                f"  {active_run.started_at.strftime('%H:%M:%S')}",
+                "",
+                "Elapsed:",
+                f"  {format_elapsed_duration(active_run.started_at, now)}",
+                "",
+                "Command:",
+                "  one pass",
+                "",
+                "Options:",
+                f"  {active_run.options_summary}",
+                "",
+                "Codex:",
+                f"  {active_run.codex_bin}",
+            ]
+        )
+        return "\n".join(lines)
+
+    if last_run is not None:
+        lines.extend(
+            [
+                "Last run:",
+                f"  {last_run.selected_id} - {last_run.selected_title}",
+                "",
+                "Result:",
+                f"  {format_run_result(last_run)}",
+                "",
+            ]
+        )
+        reload_error = last_run.reload_error or load_error
+        if reload_error:
+            lines.extend(["Reload:", f"  Load failed: {reload_error}"])
+        else:
+            append_current_selection_lines(lines, loaded_view, None)
+        return "\n".join(lines)
+
+    if load_error:
+        lines.extend(["Load failed:", load_error])
+        return "\n".join(lines)
+
+    if loaded_view is None:
+        lines.append("No valid plan loaded.")
+        return "\n".join(lines)
+
+    if loaded_view.selected is None:
+        lines.extend(["Plan complete.", "No runnable item selected."])
+        return "\n".join(lines)
+
+    item = loaded_view.selected
+    lines.extend(
+        [
+            "Selected:",
+            f"  {item.id} - {item.title}",
+            "",
+            "Type:",
+            f"  {item.type}",
+            "",
+            "Status:",
+            f"  {item.status}",
+        ]
+    )
+    if loaded_view.selected_parent is not None:
+        parent = loaded_view.selected_parent
+        lines.extend(["", "Parent:", f"  {parent.id} - {parent.title}"])
+    if loaded_view.warning is not None:
+        lines.extend(["", "Warning:", f"  {loaded_view.warning}"])
+    return "\n".join(lines)
 
 
 class PlanExecutorTui(App[None]):
@@ -324,6 +478,10 @@ class PlanExecutorTui(App[None]):
         self.safe_quit_dialog_open = False
         self.current_run_selected_id: str | None = None
         self.current_run_started_at: datetime | None = None
+        self.active_run: ActiveRunSnapshot | None = None
+        self.last_run_result: LastRunResult | None = None
+        self.current_load_error: str | None = None
+        self.elapsed_refresh_timer: Any | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -348,7 +506,7 @@ class PlanExecutorTui(App[None]):
             progress_panel.border_title = "Progress"
             with progress_panel:
                 yield Static("No plan loaded.", id="progress")
-            yield Static("Current Selection\n\nNo plan loaded.", id="selection")
+            yield Static("Current Selection\n\nNo valid plan loaded.", id="selection")
         with Vertical(id="options"):
             with Horizontal(classes="option-row"):
                 yield Label("Run:", classes="option-group")
@@ -429,6 +587,9 @@ class PlanExecutorTui(App[None]):
 
     def on_mount(self) -> None:
         self.append_log("TUI started.")
+        self.elapsed_refresh_timer = self.set_interval(
+            1.0, self.refresh_running_selection
+        )
         self.update_command_preview()
         self.update_control_state()
         if self.initial_plan_path:
@@ -521,11 +682,23 @@ class PlanExecutorTui(App[None]):
             return
 
         selected_id = self.loaded_view.selected.id
+        selected_title = self.loaded_view.selected.title
         plan_path = self.plan_path_text
         self.run_in_progress = True
         self.quit_after_run = False
+        self.last_run_result = None
+        self.current_load_error = None
         self.current_run_selected_id = selected_id
-        self.current_run_started_at = datetime.now()
+        started_at = datetime.now()
+        self.current_run_started_at = started_at
+        self.active_run = ActiveRunSnapshot(
+            selected_id=selected_id,
+            selected_title=selected_title,
+            started_at=started_at,
+            options_summary=summarize_tui_options(options),
+            codex_bin=options.codex_bin,
+        )
+        self.render_selection_panel()
         self.update_run_status(f"Running {selected_id}")
         self.update_control_state()
         self.run_worker(
@@ -553,7 +726,15 @@ class PlanExecutorTui(App[None]):
         self.query_one("#plan-path", Input).blur()
         self.set_focus(None)
 
-    def load_plan(self, plan_path: str | None = None, *, log_load: bool = True) -> bool:
+    def load_plan(
+        self,
+        plan_path: str | None = None,
+        *,
+        log_load: bool = True,
+        preserve_last_run: bool = False,
+    ) -> bool:
+        if not preserve_last_run:
+            self.last_run_result = None
         if plan_path is None:
             plan_path = self.plan_path_text
         plan_text = plan_path.strip()
@@ -568,6 +749,7 @@ class PlanExecutorTui(App[None]):
             error = state.load_error or "unknown error"
             log_error = error.removeprefix(f"{plan_text}: ")
             self.loaded_view = None
+            self.current_load_error = error
             self.render_invalid_plan(error)
             if log_load:
                 self.append_log(f"Failed to load plan: {plan_text}: {log_error}")
@@ -585,8 +767,9 @@ class PlanExecutorTui(App[None]):
         view = state.view
 
         self.loaded_view = view
+        self.current_load_error = None
         self.render_progress(view)
-        self.render_selection(view)
+        self.render_selection_panel()
         selected_id = view.selected.id if view.selected is not None else None
         if log_load:
             if selected_id is None:
@@ -609,37 +792,30 @@ class PlanExecutorTui(App[None]):
 
     def render_invalid_plan(self, error: str) -> None:
         self.query_one("#progress", Static).update("No valid plan loaded.")
-        self.query_one("#selection", Static).update(
-            f"Current Selection\n\nFailed to load plan: {error}"
-        )
+        self.current_load_error = error
+        if self.last_run_result is not None:
+            self.last_run_result.reload_error = error
+        self.render_selection_panel()
 
     def render_selection(self, view: plan_executor.PlanStatusView) -> None:
-        lines = [
-            "Current Selection",
-            "",
-            f"Plan file: {view.plan_file}",
-            "Mode: in-place",
-            f"Plan ID: {view.plan_id}",
-        ]
-        if view.selected is None:
-            lines.append("Plan complete: no unfinished items remain.")
-        else:
-            item = view.selected
-            lines.extend(
-                [
-                    f"Selected ID: {item.id}",
-                    f"Title: {item.title}",
-                    f"Type: {item.type}",
-                    f"Status: {item.status}",
-                ]
+        self.loaded_view = view
+        self.current_load_error = None
+        self.render_selection_panel()
+
+    def render_selection_panel(self, now: datetime | None = None) -> None:
+        self.query_one("#selection", Static).update(
+            build_selection_panel_text(
+                self.loaded_view,
+                self.active_run,
+                self.last_run_result,
+                self.current_load_error,
+                now or datetime.now(),
             )
-            if view.selected_parent is not None:
-                parent = view.selected_parent
-                lines.append(f"Parent: {parent.id} - {parent.title}")
-            if view.warning is not None:
-                lines.append(f"Warning: {view.warning}")
-            lines.append(f"Suggested prompt: {view.suggested_prompt}")
-        self.query_one("#selection", Static).update("\n".join(lines))
+        )
+
+    def refresh_running_selection(self) -> None:
+        if self.run_in_progress:
+            self.render_selection_panel()
 
     def update_command_preview(self) -> None:
         options = self.current_options()
@@ -694,6 +870,19 @@ class PlanExecutorTui(App[None]):
     ) -> None:
         return_code: int | None = None
         failed = False
+        failure_message: str | None = None
+        if self.active_run is None:
+            selected_title = selected_id
+            if self.loaded_view is not None and self.loaded_view.selected is not None:
+                selected_title = self.loaded_view.selected.title
+            self.active_run = ActiveRunSnapshot(
+                selected_id=selected_id,
+                selected_title=selected_title,
+                started_at=datetime.now(),
+                options_summary=summarize_tui_options(options),
+                codex_bin=options.codex_bin,
+            )
+            self.render_selection_panel()
         self.append_log(f"Starting pass {selected_id}.")
         try:
             argv = plan_executor.build_tui_subprocess_argv(plan_path, options)
@@ -718,18 +907,29 @@ class PlanExecutorTui(App[None]):
             self.append_log(f"Runner exited with return code {return_code}.")
         except Exception as exc:
             failed = True
+            failure_message = str(exc)
             if return_code is None:
                 self.update_run_status("Failed")
             else:
                 self.update_run_status(f"Failed with return code {return_code}")
             self.append_log(f"Run failed: {exc}")
         finally:
+            active_run = self.active_run
+            if active_run is not None:
+                self.last_run_result = LastRunResult(
+                    selected_id=active_run.selected_id,
+                    selected_title=active_run.selected_title,
+                    finished_at=datetime.now(),
+                    return_code=return_code,
+                    failure_message=failure_message,
+                )
             self.run_in_progress = False
             self.run_process = None
             self.current_run_selected_id = None
             self.current_run_started_at = None
+            self.active_run = None
             try:
-                if self.load_plan(plan_path, log_load=False):
+                if self.load_plan(plan_path, log_load=False, preserve_last_run=True):
                     reloaded_id = (
                         self.loaded_view.selected.id
                         if self.loaded_view is not None and self.loaded_view.selected is not None
@@ -745,6 +945,9 @@ class PlanExecutorTui(App[None]):
                 failed = True
                 self.append_log(f"Reload failed after run: {exc}")
                 self.loaded_view = None
+                self.current_load_error = str(exc)
+                if self.last_run_result is not None:
+                    self.last_run_result.reload_error = str(exc)
                 self.render_invalid_plan(str(exc))
                 self.update_command_preview()
             if failed:

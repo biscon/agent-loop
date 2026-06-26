@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from tools import plan_executor
@@ -22,21 +23,31 @@ def import_tui_or_skip():
         from textual.widgets import Button, Checkbox, Input, Static
         from tools import plan_executor_tui
         from tools.plan_executor_tui import (
+            ActiveRunSnapshot,
+            LastRunResult,
             PlanExecutorTui,
             QuitAfterRunDialog,
+            build_selection_panel_text,
+            format_elapsed_duration,
             render_recent_log_lines,
+            summarize_tui_options,
         )
     except ImportError as exc:
         raise unittest.SkipTest("Textual is not available") from exc
     return (
         plan_executor_tui,
+        ActiveRunSnapshot,
+        LastRunResult,
         PlanExecutorTui,
         QuitAfterRunDialog,
+        build_selection_panel_text,
+        format_elapsed_duration,
         Button,
         Checkbox,
         Input,
         Static,
         render_recent_log_lines,
+        summarize_tui_options,
     )
 
 
@@ -102,17 +113,26 @@ def env_with_fake_git(tmp: Path) -> dict[str, str]:
     return env
 
 
+def datetime_from_text(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+
 class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         (
             self.plan_executor_tui,
+            self.ActiveRunSnapshot,
+            self.LastRunResult,
             self.PlanExecutorTui,
             self.QuitAfterRunDialog,
+            self.build_selection_panel_text,
+            self.format_elapsed_duration,
             self.Button,
             self.Checkbox,
             self.Input,
             self.Static,
             self.render_recent_log_lines,
+            self.summarize_tui_options,
         ) = import_tui_or_skip()
 
     def panel_text(self, app, selector: str) -> str:
@@ -154,13 +174,15 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
     def assert_invalid_plan_visible(self, app) -> None:
         self.assertIn("No valid plan loaded.", self.panel_text(app, "#progress"))
         selection_text = self.panel_text(app, "#selection")
-        self.assertIn("Failed to load plan:", selection_text)
-        self.assertNotIn("Selected ID: phase_01", selection_text)
+        self.assertIn("Load failed:", selection_text)
+        self.assertNotIn("phase_01 -", selection_text)
 
     def assert_valid_plan_visible(self, app) -> None:
         selection_text = self.panel_text(app, "#selection")
-        self.assertIn("Plan ID: agent_loop_test_plan", selection_text)
-        self.assertIn("Selected ID: phase_01", selection_text)
+        self.assertIn("Selected:", selection_text)
+        self.assertIn("phase_01 - Create sandbox and fixed number list", selection_text)
+        self.assertIn("Type:", selection_text)
+        self.assertIn("Status:", selection_text)
 
     def test_log_helper_renders_newest_messages_in_display_order(self) -> None:
         lines = [f"line {index}" for index in range(1, 9)]
@@ -173,6 +195,161 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
 
     def test_log_helper_handles_non_positive_visible_count(self) -> None:
         self.assertEqual(self.render_recent_log_lines(["line 1"], visible_count=0), "")
+
+    def test_selection_panel_helper_renders_idle_valid_selection(self) -> None:
+        parent = plan_executor.PlanItem(
+            id="phase_01",
+            title="Parent phase",
+            type="phase",
+            status="Planned",
+        )
+        child = plan_executor.PlanItem(
+            id="pass_01",
+            title="Child pass",
+            type="pass",
+            status="Not Started",
+            parent="phase_01",
+        )
+        view = plan_executor.PlanStatusView(
+            plan_file=Path("docs/test.md"),
+            plan_id="test_plan",
+            selected=child,
+            selected_parent=parent,
+            items=[parent, child],
+            suggested_prompt="Read docs/test.md and execute pass_01 only.",
+        )
+
+        text = self.build_selection_panel_text(
+            view,
+            None,
+            None,
+            None,
+            datetime_from_text("2026-06-26 12:00:00"),
+        )
+
+        self.assertIn("pass_01 - Child pass", text)
+        self.assertIn("Type:\n  pass", text)
+        self.assertIn("Status:\n  Not Started", text)
+        self.assertIn("Parent:\n  phase_01 - Parent phase", text)
+
+    def test_selection_panel_helper_renders_no_valid_plan_without_stale_selection(self) -> None:
+        text = self.build_selection_panel_text(
+            None,
+            None,
+            None,
+            "fake load error",
+            datetime_from_text("2026-06-26 12:00:00"),
+        )
+
+        self.assertIn("Load failed:", text)
+        self.assertIn("fake load error", text)
+        self.assertNotIn("phase_01", text)
+
+    def test_selection_panel_helper_renders_running_state(self) -> None:
+        started = datetime_from_text("2026-06-26 12:00:00")
+        active = self.ActiveRunSnapshot(
+            selected_id="phase_03",
+            selected_title="Some title",
+            started_at=started,
+            options_summary=self.summarize_tui_options(
+                plan_executor.TuiOptions(
+                    review_after_pass=True,
+                    fix_after_review=True,
+                    commit_after_pass=True,
+                )
+            ),
+            codex_bin="/tmp/fake-codex",
+        )
+
+        text = self.build_selection_panel_text(
+            None,
+            active,
+            None,
+            None,
+            datetime_from_text("2026-06-26 12:00:37"),
+        )
+
+        self.assertIn("Running:", text)
+        self.assertIn("phase_03 - Some title", text)
+        self.assertIn("Elapsed:\n  00:37", text)
+        self.assertIn("Options:\n  review, fix, commit", text)
+        self.assertIn("Codex:\n  /tmp/fake-codex", text)
+
+    def test_selection_panel_helper_renders_finished_state(self) -> None:
+        current = plan_executor.PlanItem(
+            id="phase_04",
+            title="Next title",
+            type="phase",
+            status="Planned",
+        )
+        view = plan_executor.PlanStatusView(
+            plan_file=Path("docs/test.md"),
+            plan_id="test_plan",
+            selected=current,
+            selected_parent=None,
+            items=[current],
+            suggested_prompt="Read docs/test.md and execute phase_04 only.",
+        )
+        result = self.LastRunResult(
+            selected_id="phase_03",
+            selected_title="Some title",
+            finished_at=datetime_from_text("2026-06-26 12:01:00"),
+            return_code=42,
+        )
+
+        text = self.build_selection_panel_text(
+            view,
+            None,
+            result,
+            None,
+            datetime_from_text("2026-06-26 12:01:00"),
+        )
+
+        self.assertIn("Last run:", text)
+        self.assertIn("phase_03 - Some title", text)
+        self.assertIn("Failed with return code 42", text)
+        self.assertIn("Current selection:", text)
+        self.assertIn("phase_04 - Next title", text)
+
+    def test_selection_panel_helper_renders_internal_failure_without_return_code(self) -> None:
+        result = self.LastRunResult(
+            selected_id="phase_03",
+            selected_title="Some title",
+            finished_at=datetime_from_text("2026-06-26 12:01:00"),
+            failure_message="subprocess launch failed",
+        )
+
+        text = self.build_selection_panel_text(
+            None,
+            None,
+            result,
+            None,
+            datetime_from_text("2026-06-26 12:01:00"),
+        )
+
+        self.assertIn("phase_03 - Some title", text)
+        self.assertIn("Failed: subprocess launch failed", text)
+
+    def test_selection_panel_helper_renders_reload_failure_after_run(self) -> None:
+        result = self.LastRunResult(
+            selected_id="phase_03",
+            selected_title="Some title",
+            finished_at=datetime_from_text("2026-06-26 12:01:00"),
+            return_code=0,
+            reload_error="invalid JSON",
+        )
+
+        text = self.build_selection_panel_text(
+            None,
+            None,
+            result,
+            "invalid JSON",
+            datetime_from_text("2026-06-26 12:01:00"),
+        )
+
+        self.assertIn("Finished with return code 0", text)
+        self.assertIn("Reload:", text)
+        self.assertIn("Load failed: invalid JSON", text)
 
     async def test_tui_run_pass_disabled_before_valid_plan_load(self) -> None:
         app = self.PlanExecutorTui()
@@ -242,6 +419,10 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 self.assertIn("Run failed.", self.log_text(app))
+                self.assertIn(
+                    "Failed: fake subprocess failure",
+                    self.panel_text(app, "#selection"),
+                )
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
@@ -278,6 +459,62 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Reloaded plan. Selected phase_01.", rendered_log)
                 self.assertNotIn("fake stdout", rendered_log)
                 self.assertNotIn("fake stderr", rendered_log)
+                selection_text = self.panel_text(app, "#selection")
+                self.assertIn("Last run:", selection_text)
+                self.assertIn("phase_01 - Create sandbox and fixed number list", selection_text)
+                self.assertIn("Failed with return code 42", selection_text)
+                self.assertIn("Current selection:", selection_text)
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_manual_load_clears_last_run_result(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return self.FakeProcess(42, self.fake_stream(), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+
+                app.action_run_pass()
+                for _ in range(10):
+                    await pilot.pause(0.05)
+                    if not app.run_in_progress:
+                        break
+                self.assertIn("Last run:", self.panel_text(app, "#selection"))
+
+                await self.click_load(pilot)
+
+                selection_text = self.panel_text(app, "#selection")
+                self.assertNotIn("Last run:", selection_text)
+                self.assertIn("Selected:", selection_text)
+        finally:
+            self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
+
+    async def test_tui_repeated_runs_reuse_elapsed_refresh_timer_reference(self) -> None:
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return self.FakeProcess(0, self.fake_stream(), self.fake_stream())
+
+        original_create = self.plan_executor_tui.asyncio.create_subprocess_exec
+        self.plan_executor_tui.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        try:
+            app = self.PlanExecutorTui()
+            async with app.run_test() as pilot:
+                await self.set_plan_path(app, pilot, VALID_TUI_PLAN)
+                await self.click_load(pilot)
+                timer = app.elapsed_refresh_timer
+                self.assertIsNotNone(timer)
+
+                for _ in range(2):
+                    app.action_run_pass()
+                    for _ in range(10):
+                        await pilot.pause(0.05)
+                        if not app.run_in_progress:
+                            break
+                    self.assertIs(app.elapsed_refresh_timer, timer)
         finally:
             self.plan_executor_tui.asyncio.create_subprocess_exec = original_create
 
@@ -335,7 +572,7 @@ class TuiPilotTests(unittest.IsolatedAsyncioTestCase):
             quit_button = dialog.query_one("#quit-after-run", self.Button)
 
             self.assertEqual(str(cancel_button.label), "Cancel")
-            self.assertEqual(str(quit_button.label), "Quit after current pass")
+            self.assertEqual(str(quit_button.label), "Exit after run")
 
     async def test_tui_ctrl_c_opens_safe_quit_modal_while_input_focused(self) -> None:
         app = self.PlanExecutorTui()
